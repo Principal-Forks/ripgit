@@ -537,7 +537,7 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     hasher.digest().bytes()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 

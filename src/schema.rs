@@ -86,6 +86,19 @@ pub fn init(sql: &SqlStorage) {
     )
     .expect("create blobs");
 
+    // Raw object bytes for commits and trees. Stored verbatim so we can
+    // return them byte-for-byte identical during fetch (preserving timezone,
+    // entry order, etc. that the parsed tables lose).
+    // Blobs are NOT stored here — they're reconstructed from xpatch chains.
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS raw_objects (
+            hash TEXT PRIMARY KEY,
+            data BLOB NOT NULL
+        )",
+        None,
+    )
+    .expect("create raw_objects");
+
     // -- Indexes --
 
     sql.exec(

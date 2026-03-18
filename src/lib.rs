@@ -1,5 +1,7 @@
+mod git;
 mod pack;
 mod schema;
+mod store;
 
 use worker::*;
 
@@ -53,7 +55,7 @@ impl DurableObject for Repository {
         Self { sql, env }
     }
 
-    async fn fetch(&self, req: Request) -> Result<Response> {
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
         let url = req.url()?;
         let path = url.path();
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -85,12 +87,12 @@ impl DurableObject for Repository {
                 }
             }
             (Method::Post, "git-receive-pack") => {
-                // TODO: step 3
-                Response::error("Not implemented", 501)
+                let body = req.bytes().await?;
+                git::handle_receive_pack(&self.sql, &body)
             }
             (Method::Post, "git-upload-pack") => {
-                // TODO: step 4
-                Response::error("Not implemented", 501)
+                let body = req.bytes().await?;
+                git::handle_upload_pack(&self.sql, &body)
             }
 
             // -- Read API --
@@ -156,7 +158,7 @@ impl Repository {
         pkt_line(&mut body, &svc_line);
         body.extend_from_slice(b"0000"); // flush
 
-        let caps = "report-status delete-refs ofs-delta side-band-64k";
+        let caps = "report-status delete-refs ofs-delta";
 
         if refs.is_empty() {
             // Empty repo: advertise zero-id with capabilities

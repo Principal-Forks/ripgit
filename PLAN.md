@@ -449,3 +449,8 @@ milestone. Steps 4, 5, 6 can proceed in any order after their deps.
 - **AGPL**: xpatch is AGPL-licensed. Running it as a network service means
   source must be available to users. Decide whether this is acceptable or
   whether to replace xpatch with a permissively-licensed delta library.
+- **side-band-64k**: We removed this capability from ref advertisement to
+  avoid having to sideband-wrap the report-status response. Should be added
+  back later — it enables progress reporting during push/fetch (band 2) and
+  structured error messages (band 3). Requires wrapping all response
+  pkt-lines with a `\x01` prefix byte (band 1 = primary data).

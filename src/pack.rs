@@ -76,8 +76,6 @@ type Result<T> = std::result::Result<T, ParseError>;
 /// Handles regular objects (commit, tree, blob, tag) and delta objects
 /// (OFS_DELTA, REF_DELTA) by resolving them against their base.
 pub fn parse(data: &[u8]) -> Result<Vec<PackObject>> {
-    let mut pos = 0;
-
     // Header: "PACK" <version:4> <num_objects:4>
     if data.len() < 12 {
         return Err(ParseError("pack too short for header".into()));
@@ -90,7 +88,7 @@ pub fn parse(data: &[u8]) -> Result<Vec<PackObject>> {
         return Err(ParseError(format!("unsupported pack version {}", version)));
     }
     let num_objects = read_u32_be(data, 8) as usize;
-    pos = 12;
+    let mut pos = 12;
 
     // First pass: parse all entries, collecting raw data and delta references.
     // We need this because REF_DELTA can reference any object by hash, which

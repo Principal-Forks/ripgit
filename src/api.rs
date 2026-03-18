@@ -76,6 +76,7 @@ pub fn handle_log(sql: &SqlStorage, url: &Url) -> Result<Response> {
     #[derive(serde::Deserialize)]
     struct ParentRow {
         parent_hash: String,
+        #[allow(dead_code)]
         ordinal: i64,
     }
 

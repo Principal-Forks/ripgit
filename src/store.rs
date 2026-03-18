@@ -833,65 +833,84 @@ fn load_blob_content(sql: &SqlStorage, blob_hash: &str) -> Result<Option<Vec<u8>
     }
 }
 
+// NOTE: build_raw_commit / build_raw_tree / hex_decode were removed.
+// We store raw object bytes in `raw_objects` during push and return them
+// verbatim during fetch, so we never need to re-serialize commits or trees.
+
 // ---------------------------------------------------------------------------
-// Raw git object serialization (for pack generation)
+// FTS5 index rebuild
 // ---------------------------------------------------------------------------
 
-/// Rebuild the raw bytes of a commit object (what git stores internally).
-fn build_raw_commit(
-    tree_hash: &str,
-    parents: &[&str],
-    author: &str,
-    author_email: &str,
-    author_time: i64,
-    committer: &str,
-    committer_email: &str,
-    commit_time: i64,
-    message: &str,
-) -> Vec<u8> {
-    let mut buf = String::new();
-    buf.push_str(&format!("tree {}\n", tree_hash));
-    for parent in parents {
-        buf.push_str(&format!("parent {}\n", parent));
+/// Rebuild the FTS5 full-text search index from the HEAD of the default branch.
+/// Walks the tree at `commit_hash`, reconstructs each text blob, and inserts
+/// into `fts_head`.
+pub fn rebuild_fts_index(sql: &SqlStorage, commit_hash: &str) -> Result<()> {
+    // Get the tree root for this commit
+    #[derive(serde::Deserialize)]
+    struct CommitRow {
+        tree_hash: String,
     }
-    // Use +0000 as timezone — we don't store timezone in the schema,
-    // so this is lossy but valid. The hash is computed from the original
-    // raw bytes during push, so this is only used for fetch pack generation.
-    buf.push_str(&format!(
-        "author {} <{}> {} +0000\n",
-        author, author_email, author_time
-    ));
-    buf.push_str(&format!(
-        "committer {} <{}> {} +0000\n",
-        committer, committer_email, commit_time
-    ));
-    buf.push('\n');
-    buf.push_str(message);
-    buf.into_bytes()
-}
+    let commits: Vec<CommitRow> = sql
+        .exec(
+            "SELECT tree_hash FROM commits WHERE hash = ?",
+            vec![SqlStorageValue::from(commit_hash.to_string())],
+        )?
+        .to_array()?;
 
-/// Rebuild the raw bytes of a tree object (binary format).
-fn build_raw_tree(entries: &[TreeEntry]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for entry in entries {
-        // Mode as octal ASCII (without leading zero for directories)
-        buf.extend_from_slice(format!("{:o}", entry.mode).as_bytes());
-        buf.push(b' ');
-        buf.extend_from_slice(entry.name.as_bytes());
-        buf.push(0); // NUL
-                     // 20-byte raw hash
-        buf.extend_from_slice(&hex_decode(&entry.hash));
+    let tree_hash = match commits.into_iter().next() {
+        Some(c) => c.tree_hash,
+        None => return Ok(()), // commit not found, skip
+    };
+
+    // Clear existing index
+    sql.exec("DELETE FROM fts_head", None)?;
+
+    // Walk the tree and index all text blobs
+    let empty_pack_trees = HashMap::new();
+    let mut visited = HashMap::new();
+    let mut blob_paths = HashMap::new();
+
+    walk_tree(
+        sql,
+        &empty_pack_trees,
+        &tree_hash,
+        "",
+        &mut blob_paths,
+        &mut visited,
+    )?;
+
+    for (blob_hash, path) in &blob_paths {
+        // Load and reconstruct blob content
+        let content = match load_blob_content(sql, blob_hash)? {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Skip binary files: check for null bytes in the first 8KB
+        let check_len = content.len().min(8192);
+        if content[..check_len].contains(&0) {
+            continue;
+        }
+
+        // Skip very large files (>1MB) to keep the index reasonable
+        if content.len() > 1_048_576 {
+            continue;
+        }
+
+        // Convert to UTF-8, skip if invalid
+        let text = match std::str::from_utf8(&content) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        sql.exec(
+            "INSERT INTO fts_head (path, content) VALUES (?, ?)",
+            vec![
+                SqlStorageValue::from(path.clone()),
+                SqlStorageValue::from(text.to_string()),
+            ],
+        )?;
     }
-    buf
-}
 
-/// Decode a hex string to raw bytes.
-fn hex_decode(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .filter_map(|i| {
-            hex.get(i..i + 2)
-                .and_then(|s| u8::from_str_radix(s, 16).ok())
-        })
-        .collect()
+    Ok(())
 }

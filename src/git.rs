@@ -87,7 +87,17 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         results.push((cmd.ref_name.clone(), result));
     }
 
-    // --- 5. Return report-status ---
+    // --- 5. Rebuild FTS index if default branch was updated ---
+    for (ref_name, result) in &results {
+        if result.is_ok() && ref_name == "refs/heads/main" {
+            let cmd = commands.iter().find(|c| c.ref_name == *ref_name);
+            if let Some(cmd) = cmd {
+                let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+            }
+        }
+    }
+
+    // --- 6. Return report-status ---
     let status_body = build_report_status(&results);
 
     let mut resp = Response::from_bytes(status_body)?;

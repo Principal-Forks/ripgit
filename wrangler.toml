@@ -1,0 +1,15 @@
+name = "ripgit"
+main = "build/index.js"
+compatibility_date = "2026-03-18"
+
+[build]
+command = "cargo install -q \"worker-build@^0.7\" && worker-build --release"
+
+[durable_objects]
+bindings = [
+  { name = "REPOSITORY", class_name = "Repository" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Repository"]

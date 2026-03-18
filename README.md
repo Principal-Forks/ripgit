@@ -107,12 +107,8 @@ The `.cargo/config.toml` is pre-configured to point `CC_wasm32_unknown_unknown` 
 This is a working proof of concept, not production software.
 
 - **No auth** -- anyone with the URL can push and read. Add Cloudflare Access or token auth for real use.
-- **Chunked encoding** -- pushes > 1 MiB require `git -c http.postBuffer=524288000 push` until the Worker-side buffering fix lands. See TODOS.md.
 - **Memory** -- the entire pack is loaded into memory during push/fetch. Repos with packs exceeding ~100 MB will hit the 128 MB DO memory limit.
 - **No force push** -- untested and may produce inconsistent state.
-- **License** -- xpatch is AGPL-licensed. Running ripgit as a hosted service triggers AGPL copyleft requirements.
-
-See [TODOS.md](TODOS.md) for the full list of current work and planned fixes.
 
 ## Acknowledgments
 

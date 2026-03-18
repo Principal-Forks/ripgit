@@ -136,6 +136,16 @@ pub fn init(sql: &SqlStorage) {
     )
     .expect("create idx_blob_groups_path");
 
+    // -- Config --
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        None,
+    )
+    .expect("create config");
+
     // -- FTS5 --
     // FTS5 virtual tables don't support IF NOT EXISTS in all SQLite builds.
     // Wrap in a check against sqlite_master to be safe.
@@ -144,4 +154,11 @@ pub fn init(sql: &SqlStorage) {
         None,
     )
     .expect("create fts_head");
+
+    // FTS5 for commit message search
+    sql.exec(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_commits USING fts5(hash UNINDEXED, message, author)",
+        None,
+    )
+    .expect("create fts_commits");
 }

@@ -230,6 +230,16 @@ pub fn store_commit(sql: &SqlStorage, hash: &str, c: &ParsedCommit, raw_data: &[
     // Build binary lifting table
     build_commit_graph(sql, hash, c.parents.first().map(|s| s.as_str()))?;
 
+    // Index commit message for FTS search
+    sql.exec(
+        "INSERT OR IGNORE INTO fts_commits (hash, message, author) VALUES (?, ?, ?)",
+        vec![
+            SqlStorageValue::from(hash.to_string()),
+            SqlStorageValue::from(c.message.clone()),
+            SqlStorageValue::from(c.author.clone()),
+        ],
+    )?;
+
     Ok(())
 }
 
@@ -649,7 +659,7 @@ fn walk_tree(
     Ok(())
 }
 
-fn load_tree_from_db(sql: &SqlStorage, tree_hash: &str) -> Result<Vec<TreeEntry>> {
+pub fn load_tree_from_db(sql: &SqlStorage, tree_hash: &str) -> Result<Vec<TreeEntry>> {
     #[derive(serde::Deserialize)]
     struct Row {
         mode: i64,
@@ -838,34 +848,95 @@ fn load_blob_content(sql: &SqlStorage, blob_hash: &str) -> Result<Option<Vec<u8>
 // verbatim during fetch, so we never need to re-serialize commits or trees.
 
 // ---------------------------------------------------------------------------
-// FTS5 index rebuild
+// Config helpers
 // ---------------------------------------------------------------------------
 
-/// Rebuild the FTS5 full-text search index from the HEAD of the default branch.
-/// Walks the tree at `commit_hash`, reconstructs each text blob, and inserts
-/// into `fts_head`.
-pub fn rebuild_fts_index(sql: &SqlStorage, commit_hash: &str) -> Result<()> {
-    // Get the tree root for this commit
+pub fn get_config(sql: &SqlStorage, key: &str) -> Result<Option<String>> {
     #[derive(serde::Deserialize)]
-    struct CommitRow {
-        tree_hash: String,
+    struct Row {
+        value: String,
     }
-    let commits: Vec<CommitRow> = sql
+    let rows: Vec<Row> = sql
         .exec(
-            "SELECT tree_hash FROM commits WHERE hash = ?",
-            vec![SqlStorageValue::from(commit_hash.to_string())],
+            "SELECT value FROM config WHERE key = ?",
+            vec![SqlStorageValue::from(key.to_string())],
         )?
         .to_array()?;
+    Ok(rows.into_iter().next().map(|r| r.value))
+}
 
-    let tree_hash = match commits.into_iter().next() {
-        Some(c) => c.tree_hash,
-        None => return Ok(()), // commit not found, skip
+pub fn set_config(sql: &SqlStorage, key: &str, value: &str) -> Result<()> {
+    sql.exec(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        vec![
+            SqlStorageValue::from(key.to_string()),
+            SqlStorageValue::from(value.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FTS5 index rebuild (incremental when possible)
+// ---------------------------------------------------------------------------
+
+/// Rebuild the FTS5 code search index. If a previous indexed commit exists,
+/// uses the diff engine to only update changed files. Otherwise does a full
+/// tree walk.
+pub fn rebuild_fts_index(sql: &SqlStorage, new_commit_hash: &str) -> Result<()> {
+    let new_tree = match commit_tree_hash(sql, new_commit_hash)? {
+        Some(h) => h,
+        None => return Ok(()),
     };
 
-    // Clear existing index
+    let prev_commit = get_config(sql, "fts_indexed_commit")?;
+
+    if let Some(ref prev_hash) = prev_commit {
+        if let Some(old_tree) = commit_tree_hash(sql, prev_hash)? {
+            // Incremental rebuild: only touch changed files
+            let changes = crate::diff::diff_trees(sql, Some(&old_tree), Some(&new_tree))?;
+
+            for file in &changes {
+                match file.status {
+                    crate::diff::DiffStatus::Deleted => {
+                        sql.exec(
+                            "DELETE FROM fts_head WHERE path = ?",
+                            vec![SqlStorageValue::from(file.path.clone())],
+                        )?;
+                    }
+                    crate::diff::DiffStatus::Added => {
+                        if let Some(hash) = &file.new_hash {
+                            index_file_for_fts(sql, &file.path, hash)?;
+                        }
+                    }
+                    crate::diff::DiffStatus::Modified => {
+                        sql.exec(
+                            "DELETE FROM fts_head WHERE path = ?",
+                            vec![SqlStorageValue::from(file.path.clone())],
+                        )?;
+                        if let Some(hash) = &file.new_hash {
+                            index_file_for_fts(sql, &file.path, hash)?;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Previous commit lost — fall back to full rebuild
+            full_fts_rebuild(sql, &new_tree)?;
+        }
+    } else {
+        // First index — full rebuild
+        full_fts_rebuild(sql, &new_tree)?;
+    }
+
+    set_config(sql, "fts_indexed_commit", new_commit_hash)?;
+    Ok(())
+}
+
+/// Full rebuild: wipe the index and re-index every file in the tree.
+fn full_fts_rebuild(sql: &SqlStorage, tree_hash: &str) -> Result<()> {
     sql.exec("DELETE FROM fts_head", None)?;
 
-    // Walk the tree and index all text blobs
     let empty_pack_trees = HashMap::new();
     let mut visited = HashMap::new();
     let mut blob_paths = HashMap::new();
@@ -873,44 +944,288 @@ pub fn rebuild_fts_index(sql: &SqlStorage, commit_hash: &str) -> Result<()> {
     walk_tree(
         sql,
         &empty_pack_trees,
-        &tree_hash,
+        tree_hash,
         "",
         &mut blob_paths,
         &mut visited,
     )?;
 
     for (blob_hash, path) in &blob_paths {
-        // Load and reconstruct blob content
-        let content = match load_blob_content(sql, blob_hash)? {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Skip binary files: check for null bytes in the first 8KB
-        let check_len = content.len().min(8192);
-        if content[..check_len].contains(&0) {
-            continue;
-        }
-
-        // Skip very large files (>1MB) to keep the index reasonable
-        if content.len() > 1_048_576 {
-            continue;
-        }
-
-        // Convert to UTF-8, skip if invalid
-        let text = match std::str::from_utf8(&content) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        sql.exec(
-            "INSERT INTO fts_head (path, content) VALUES (?, ?)",
-            vec![
-                SqlStorageValue::from(path.clone()),
-                SqlStorageValue::from(text.to_string()),
-            ],
-        )?;
+        index_file_for_fts(sql, path, blob_hash)?;
     }
 
     Ok(())
+}
+
+/// Index a single file into fts_head. Skips binary, large (>1 MiB), and
+/// non-UTF-8 files.
+fn index_file_for_fts(sql: &SqlStorage, path: &str, blob_hash: &str) -> Result<()> {
+    let content = match load_blob_content(sql, blob_hash)? {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    let check_len = content.len().min(8192);
+    if content[..check_len].contains(&0) {
+        return Ok(()); // binary
+    }
+    if content.len() > 1_048_576 {
+        return Ok(()); // too large
+    }
+
+    let text = match std::str::from_utf8(&content) {
+        Ok(t) => t,
+        Err(_) => return Ok(()), // not UTF-8
+    };
+
+    sql.exec(
+        "INSERT INTO fts_head (path, content) VALUES (?, ?)",
+        vec![
+            SqlStorageValue::from(path.to_string()),
+            SqlStorageValue::from(text.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Get the tree hash for a commit.
+fn commit_tree_hash(sql: &SqlStorage, commit_hash: &str) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        tree_hash: String,
+    }
+    let rows: Vec<Row> = sql
+        .exec(
+            "SELECT tree_hash FROM commits WHERE hash = ?",
+            vec![SqlStorageValue::from(commit_hash.to_string())],
+        )?
+        .to_array()?;
+    Ok(rows.into_iter().next().map(|r| r.tree_hash))
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+pub struct CodeSearchResult {
+    pub path: String,
+    pub matches: Vec<LineMatch>,
+}
+
+pub struct LineMatch {
+    pub line_number: usize,
+    pub line_text: String,
+}
+
+pub struct CommitSearchResult {
+    pub hash: String,
+    pub message: String,
+    pub author: String,
+    pub commit_time: i64,
+}
+
+/// Search code in the FTS index. Auto-detects whether to use FTS5 MATCH
+/// (for word queries) or INSTR (for literal/symbol queries).
+/// Returns all matching lines with line numbers, not just one snippet per file.
+pub fn search_code(
+    sql: &SqlStorage,
+    query: &str,
+    path_filter: Option<&str>,
+    ext_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CodeSearchResult>> {
+    let (search_term, literal) = if let Some(stripped) = query.strip_prefix("lit:") {
+        (stripped, true)
+    } else {
+        (query, needs_literal_search(query))
+    };
+
+    let files = if literal {
+        search_files_literal(sql, search_term, path_filter, ext_filter, limit)?
+    } else {
+        search_files_fts(sql, search_term, path_filter, ext_filter, limit)?
+    };
+
+    // Scan each file for matching lines
+    let mut results = Vec::new();
+    let mut total_matches = 0usize;
+    let max_matches = 500;
+    let term_lower = search_term.to_lowercase();
+
+    for (path, content) in files {
+        if total_matches >= max_matches {
+            break;
+        }
+
+        let mut line_matches = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            let found = if literal {
+                line.contains(search_term)
+            } else {
+                line.to_lowercase().contains(&term_lower)
+            };
+
+            if found {
+                line_matches.push(LineMatch {
+                    line_number: i + 1,
+                    line_text: line.to_string(),
+                });
+                total_matches += 1;
+                if total_matches >= max_matches {
+                    break;
+                }
+            }
+        }
+
+        if !line_matches.is_empty() {
+            results.push(CodeSearchResult {
+                path,
+                matches: line_matches,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Search commit messages via FTS5.
+pub fn search_commits(
+    sql: &SqlStorage,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<CommitSearchResult>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        hash: String,
+        message: String,
+        author: String,
+    }
+
+    let rows: Vec<Row> = sql
+        .exec(
+            "SELECT hash, message, author FROM fts_commits
+             WHERE fts_commits MATCH ?
+             ORDER BY rank
+             LIMIT ?",
+            vec![
+                SqlStorageValue::from(query.to_string()),
+                SqlStorageValue::from(limit as i64),
+            ],
+        )?
+        .to_array()?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        // Look up commit_time from the commits table
+        #[derive(serde::Deserialize)]
+        struct TimeRow {
+            commit_time: i64,
+        }
+        let time_rows: Vec<TimeRow> = sql
+            .exec(
+                "SELECT commit_time FROM commits WHERE hash = ?",
+                vec![SqlStorageValue::from(row.hash.clone())],
+            )?
+            .to_array()?;
+
+        let commit_time = time_rows
+            .into_iter()
+            .next()
+            .map(|r| r.commit_time)
+            .unwrap_or(0);
+
+        results.push(CommitSearchResult {
+            hash: row.hash,
+            message: row.message,
+            author: row.author,
+            commit_time,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Detect if a query needs literal (INSTR) search instead of FTS5 MATCH.
+/// Triggers on any character that would break or confuse FTS5 tokenization:
+/// dots, underscores, parens, colons, angle brackets, etc.
+fn needs_literal_search(query: &str) -> bool {
+    query
+        .bytes()
+        .any(|b| !matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b' ' | b'"' | b'*'))
+}
+
+/// FTS5 MATCH search — returns (path, content) pairs for files that match.
+fn search_files_fts(
+    sql: &SqlStorage,
+    query: &str,
+    path_filter: Option<&str>,
+    ext_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    // Use {content} column filter so we don't match on filenames
+    let mut where_parts = vec!["fts_head MATCH ?".to_string()];
+    let mut params: Vec<SqlStorageValue> =
+        vec![SqlStorageValue::from(format!("{{content}}: {}", query))];
+
+    if let Some(path) = path_filter {
+        where_parts.push("path LIKE ?".to_string());
+        params.push(SqlStorageValue::from(format!("{}%", path)));
+    }
+    if let Some(ext) = ext_filter {
+        where_parts.push("path LIKE ?".to_string());
+        params.push(SqlStorageValue::from(format!("%.{}", ext)));
+    }
+
+    params.push(SqlStorageValue::from(limit as i64));
+
+    let sql_str = format!(
+        "SELECT path, content FROM fts_head WHERE {} ORDER BY rank LIMIT ?",
+        where_parts.join(" AND "),
+    );
+
+    #[derive(serde::Deserialize)]
+    struct Row {
+        path: String,
+        content: String,
+    }
+
+    let rows: Vec<Row> = sql.exec(&sql_str, params)?.to_array()?;
+    Ok(rows.into_iter().map(|r| (r.path, r.content)).collect())
+}
+
+/// Literal substring search via INSTR — full table scan, but bounded by repo size.
+fn search_files_literal(
+    sql: &SqlStorage,
+    query: &str,
+    path_filter: Option<&str>,
+    ext_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut where_parts = vec!["INSTR(content, ?) > 0".to_string()];
+    let mut params: Vec<SqlStorageValue> = vec![SqlStorageValue::from(query.to_string())];
+
+    if let Some(path) = path_filter {
+        where_parts.push("path LIKE ?".to_string());
+        params.push(SqlStorageValue::from(format!("{}%", path)));
+    }
+    if let Some(ext) = ext_filter {
+        where_parts.push("path LIKE ?".to_string());
+        params.push(SqlStorageValue::from(format!("%.{}", ext)));
+    }
+
+    params.push(SqlStorageValue::from(limit as i64));
+
+    let sql_str = format!(
+        "SELECT path, content FROM fts_head WHERE {} LIMIT ?",
+        where_parts.join(" AND "),
+    );
+
+    #[derive(serde::Deserialize)]
+    struct Row {
+        path: String,
+        content: String,
+    }
+
+    let rows: Vec<Row> = sql.exec(&sql_str, params)?.to_array()?;
+    Ok(rows.into_iter().map(|r| (r.path, r.content)).collect())
 }

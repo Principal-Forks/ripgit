@@ -94,12 +94,23 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         results.push((cmd.ref_name.clone(), result));
     }
 
-    // --- 5. Rebuild FTS index if default branch was updated ---
+    // --- 5. Set default branch + rebuild FTS index ---
+    // Auto-detect default branch: first branch pushed becomes the default.
     for (ref_name, result) in &results {
-        if result.is_ok() && ref_name == "refs/heads/main" {
-            let cmd = commands.iter().find(|c| c.ref_name == *ref_name);
-            if let Some(cmd) = cmd {
-                let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+        if result.is_ok() && ref_name.starts_with("refs/heads/") {
+            if store::get_config(sql, "default_branch")?.is_none() {
+                let _ = store::set_config(sql, "default_branch", ref_name);
+            }
+        }
+    }
+
+    // Rebuild FTS if the default branch was updated
+    if let Some(default_ref) = store::get_config(sql, "default_branch")? {
+        for cmd in &commands {
+            if cmd.ref_name == default_ref {
+                if let Some((_, Ok(()))) = results.iter().find(|(r, _)| r == &cmd.ref_name) {
+                    let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+                }
             }
         }
     }

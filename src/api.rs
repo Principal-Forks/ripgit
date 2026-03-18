@@ -441,7 +441,7 @@ pub fn handle_stats(sql: &SqlStorage) -> Result<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// GET /search?q=TODO&limit=20 — FTS5 full-text search
+// GET /search?q=TODO&limit=50&scope=code&path=src/&ext=rs — search
 // ---------------------------------------------------------------------------
 
 pub fn handle_search(sql: &SqlStorage, url: &Url) -> Result<Response> {
@@ -449,42 +449,94 @@ pub fn handle_search(sql: &SqlStorage, url: &Url) -> Result<Response> {
         Some(q) => q,
         None => return Response::error("missing 'q' query parameter", 400),
     };
-    let limit: i64 = get_query(url, "limit")
+    let limit: usize = get_query(url, "limit")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(50);
+    let scope = get_query(url, "scope").unwrap_or_else(|| "code".to_string());
 
-    #[derive(serde::Deserialize, Serialize)]
-    struct SearchResult {
-        path: String,
-        snippet: String,
+    match scope.as_str() {
+        "commits" => {
+            let results = crate::store::search_commits(sql, &query, limit)?;
+            #[derive(Serialize)]
+            struct CommitResult {
+                hash: String,
+                message: String,
+                author: String,
+                commit_time: i64,
+            }
+            let items: Vec<CommitResult> = results
+                .into_iter()
+                .map(|r| CommitResult {
+                    hash: r.hash,
+                    message: r.message,
+                    author: r.author,
+                    commit_time: r.commit_time,
+                })
+                .collect();
+            Response::from_json(&serde_json::json!({
+                "scope": "commits",
+                "query": query,
+                "results": items,
+            }))
+        }
+        _ => {
+            let path_filter = get_query(url, "path");
+            let ext_filter = get_query(url, "ext");
+            let results = crate::store::search_code(
+                sql,
+                &query,
+                path_filter.as_deref(),
+                ext_filter.as_deref(),
+                limit,
+            )?;
+            #[derive(Serialize)]
+            struct FileResult {
+                path: String,
+                matches: Vec<MatchLine>,
+            }
+            #[derive(Serialize)]
+            struct MatchLine {
+                line: usize,
+                text: String,
+            }
+            let total_matches: usize = results.iter().map(|r| r.matches.len()).sum();
+            let items: Vec<FileResult> = results
+                .into_iter()
+                .map(|r| FileResult {
+                    path: r.path,
+                    matches: r
+                        .matches
+                        .into_iter()
+                        .map(|m| MatchLine {
+                            line: m.line_number,
+                            text: m.line_text,
+                        })
+                        .collect(),
+                })
+                .collect();
+            Response::from_json(&serde_json::json!({
+                "scope": "code",
+                "query": query,
+                "total_files": items.len(),
+                "total_matches": total_matches,
+                "results": items,
+            }))
+        }
     }
-
-    let results: Vec<SearchResult> = sql
-        .exec(
-            "SELECT path, snippet(fts_head, 1, '<b>', '</b>', '...', 64) AS snippet
-             FROM fts_head
-             WHERE fts_head MATCH ?
-             ORDER BY rank
-             LIMIT ?",
-            vec![SqlStorageValue::from(query), SqlStorageValue::from(limit)],
-        )?
-        .to_array()?;
-
-    Response::from_json(&results)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn get_query(url: &Url, key: &str) -> Option<String> {
+pub(crate) fn get_query(url: &Url, key: &str) -> Option<String> {
     url.query_pairs()
         .find(|(k, _)| k == key)
         .map(|(_, v): (_, _)| v.to_string())
 }
 
 /// Resolve a short ref name ("main") or full ref ("refs/heads/main") to a commit hash.
-fn resolve_ref(sql: &SqlStorage, name: &str) -> Result<Option<String>> {
+pub(crate) fn resolve_ref(sql: &SqlStorage, name: &str) -> Result<Option<String>> {
     #[derive(serde::Deserialize)]
     struct Row {
         commit_hash: String,

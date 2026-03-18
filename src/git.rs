@@ -19,8 +19,15 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // --- 1. Parse ref update commands from pkt-lines ---
     let (commands, pack_offset) = parse_ref_commands(body);
 
+    // Git splits large pushes (>http.postBuffer) into two POSTs:
+    //   1st: a 4-byte flush "0000" (no commands, no pack)
+    //   2nd: the full payload (commands + flush + pack)
+    // Return 200 for the probe so git proceeds with the real request.
     if commands.is_empty() {
-        return Err(Error::RustError("no ref update commands received".into()));
+        let mut resp = Response::from_bytes(Vec::new())?;
+        resp.headers_mut()
+            .set("Content-Type", "application/x-git-receive-pack-result")?;
+        return Ok(resp);
     }
 
     // --- 2. Parse pack file (if present) ---

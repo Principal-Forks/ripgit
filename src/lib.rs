@@ -1,3 +1,4 @@
+mod api;
 mod git;
 mod pack;
 mod schema;
@@ -96,34 +97,23 @@ impl DurableObject for Repository {
             }
 
             // -- Read API --
-            (Method::Get, "refs") => {
-                // TODO: step 5
-                Response::error("Not implemented", 501)
-            }
-            (Method::Get, "log") => {
-                // TODO: step 5
-                Response::error("Not implemented", 501)
+            (Method::Get, "refs") => api::handle_refs(&self.sql),
+            (Method::Get, "log") => api::handle_log(&self.sql, &url),
+            (Method::Get, "commit") => {
+                let hash = parts.get(3).unwrap_or(&"");
+                api::handle_commit(&self.sql, hash)
             }
             (Method::Get, "tree") => {
-                // TODO: step 5
-                Response::error("Not implemented", 501)
+                let hash = parts.get(3).unwrap_or(&"");
+                api::handle_tree(&self.sql, hash)
             }
             (Method::Get, "blob") => {
-                // TODO: step 5
-                Response::error("Not implemented", 501)
+                let hash = parts.get(3).unwrap_or(&"");
+                api::handle_blob(&self.sql, hash)
             }
-            (Method::Get, "file") => {
-                // TODO: step 5
-                Response::error("Not implemented", 501)
-            }
-            (Method::Get, "search") => {
-                // TODO: step 6
-                Response::error("Not implemented", 501)
-            }
-            (Method::Get, "stats") => {
-                // TODO: step 5
-                Response::error("Not implemented", 501)
-            }
+            (Method::Get, "file") => api::handle_file(&self.sql, &url),
+            (Method::Get, "search") => api::handle_search(&self.sql, &url),
+            (Method::Get, "stats") => api::handle_stats(&self.sql),
 
             _ => Response::error("Not Found", 404),
         }

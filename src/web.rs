@@ -13,7 +13,7 @@ type Url = worker::Url;
 // Layout: shared HTML shell
 // ---------------------------------------------------------------------------
 
-fn layout(title: &str, repo_name: &str, content: &str) -> String {
+fn layout(title: &str, repo_name: &str, default_branch: &str, content: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -35,7 +35,10 @@ fn layout(title: &str, repo_name: &str, content: &str) -> String {
     <div class="nav-links">
       <a href="/repo/{repo_name}/">Code</a>
       <a href="/repo/{repo_name}/log">Log</a>
-      <a href="/repo/{repo_name}/search-ui">Search</a>
+    </div>
+    <div class="nav-search">
+      <input type="text" id="nav-search-input" placeholder="Search..." autocomplete="off" spellcheck="false">
+      <div id="nav-search-results" class="nav-search-results" hidden></div>
     </div>
   </nav>
 </header>
@@ -53,11 +56,64 @@ setTimeout(function(){{
     if(td){{var tr=td.parentNode;tr.style.background='#fffbdd';tr.scrollIntoView({{block:'center'}})}}
   }}
 }},150);
+(function(){{
+  var inp=document.getElementById('nav-search-input');
+  var box=document.getElementById('nav-search-results');
+  if(!inp||!box) return;
+  var timer=null;
+  var repo='{repo_name}';
+  var branch='{default_branch}';
+  function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
+  inp.addEventListener('input',function(){{
+    clearTimeout(timer);
+    var q=inp.value.trim();
+    if(!q){{box.hidden=true;box.innerHTML='';return;}}
+    timer=setTimeout(function(){{doSearch(q);}},200);
+  }});
+  inp.addEventListener('keydown',function(e){{
+    if(e.key==='Enter'){{
+      var q=inp.value.trim();
+      if(q) window.location.href='/repo/'+repo+'/search-ui?q='+encodeURIComponent(q);
+      e.preventDefault();
+    }}else if(e.key==='Escape'){{
+      box.hidden=true;inp.blur();
+    }}
+  }});
+  document.addEventListener('click',function(e){{
+    if(!inp.closest('.nav-search').contains(e.target)) box.hidden=true;
+  }});
+  function doSearch(q){{
+    fetch('/repo/'+repo+'/search?q='+encodeURIComponent(q)+'&scope=code&limit=10')
+      .then(function(r){{return r.json();}})
+      .then(function(data){{
+        if(inp.value.trim()!==q) return;
+        if(!data.results||!data.results.length){{
+          box.innerHTML='<div class="nsr-empty">No results</div>';
+          box.hidden=false;return;
+        }}
+        var html='';
+        data.results.forEach(function(r){{
+          var m=r.matches[0];
+          var snippet=m?m.text.replace(/^\s+/,''):'';
+          html+='<a class="nsr-item" href="/repo/'+repo+'/blob/'+esc(branch)+'/'+esc(r.path)+(m?'#L'+m.line:'')+'">'
+            +'<div class="nsr-path">'+esc(r.path)+'</div>'
+            +(snippet?'<div class="nsr-snippet">'+esc(snippet)+'</div>':'')
+            +'</a>';
+        }});
+        html+='<a class="nsr-all" href="/repo/'+repo+'/search-ui?q='+encodeURIComponent(q)+'">'
+          +'View all \u2014 '+data.total_matches+' match'+(data.total_matches===1?'':'es')+' in '+data.total_files+' file'+(data.total_files===1?'':'s')
+          +'</a>';
+        box.innerHTML=html;box.hidden=false;
+      }})
+      .catch(function(){{}});
+  }}
+}})();
 </script>
 </body>
 </html>"#,
         title = html_escape(title),
         repo_name = html_escape(repo_name),
+        default_branch = html_escape(default_branch),
         content = content,
         CSS = CSS,
     )
@@ -381,6 +437,79 @@ h2 { font-size: 16px; margin-bottom: 12px; }
   color: #656d76;
   margin: 8px 0;
 }
+
+/* Nav search */
+.nav-search {
+  position: relative;
+  margin-left: 16px;
+}
+.nav-search input {
+  padding: 5px 10px;
+  border: 1px solid #d1d9e0;
+  border-radius: 6px;
+  font-size: 13px;
+  width: 200px;
+  background: #fff;
+  color: #1f2328;
+}
+.nav-search input:focus {
+  outline: none;
+  border-color: #0969da;
+  box-shadow: 0 0 0 3px rgba(9,105,218,0.1);
+}
+.nav-search-results {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 460px;
+  background: #fff;
+  border: 1px solid #d1d9e0;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+  z-index: 100;
+  overflow: hidden;
+  max-height: 460px;
+  overflow-y: auto;
+}
+.nsr-item {
+  display: block;
+  padding: 8px 12px;
+  border-bottom: 1px solid #f0f2f4;
+  text-decoration: none;
+  color: #1f2328;
+}
+.nsr-item:hover { background: #f6f8fa; text-decoration: none; }
+.nsr-path {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+  color: #0969da;
+}
+.nsr-snippet {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+  color: #656d76;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.nsr-empty {
+  padding: 16px 12px;
+  color: #656d76;
+  font-size: 13px;
+  text-align: center;
+}
+.nsr-all {
+  display: block;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #0969da;
+  text-align: center;
+  border-top: 1px solid #d1d9e0;
+  background: #f6f8fa;
+  text-decoration: none;
+}
+.nsr-all:hover { background: #eef1f5; text-decoration: none; }
 "#;
 
 // ---------------------------------------------------------------------------
@@ -438,7 +567,7 @@ pub fn page_home(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Respons
         None => "<p>Empty repository. Push some code to get started.</p>".to_string(),
     };
 
-    html_response(&layout("Home", repo_name, &content))
+    html_response(&layout("Home", repo_name, &ref_name, &content))
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +635,7 @@ pub fn page_tree(
     }
     html.push_str("</table>");
 
-    html_response(&layout(path, repo_name, &html))
+    html_response(&layout(path, repo_name, ref_name, &html))
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +689,7 @@ pub fn page_blob(
         ));
     }
 
-    html_response(&layout(filename, repo_name, &html))
+    html_response(&layout(filename, repo_name, ref_name, &html))
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +711,14 @@ pub fn page_log(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Response
 
     let head = match api::resolve_ref(sql, &ref_name)? {
         Some(h) => h,
-        None => return html_response(&layout("Log", repo_name, "<p>No commits yet.</p>")),
+        None => {
+            return html_response(&layout(
+                "Log",
+                repo_name,
+                &ref_name,
+                "<p>No commits yet.</p>",
+            ))
+        }
     };
 
     // Walk commit chain
@@ -641,7 +777,7 @@ pub fn page_log(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Response
     }
     html.push_str("</div>");
 
-    html_response(&layout("Log", repo_name, &html))
+    html_response(&layout("Log", repo_name, &ref_name, &html))
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +790,7 @@ pub fn page_commit(sql: &SqlStorage, repo_name: &str, hash: &str) -> Result<Resp
     }
 
     // Load commit metadata
+    let (default_branch, _) = resolve_default_branch(sql)?;
     let commit = load_commit_meta(sql, hash)?;
     let diff_result = diff::diff_commit(sql, hash, true, 3)?;
 
@@ -734,6 +871,7 @@ pub fn page_commit(sql: &SqlStorage, repo_name: &str, hash: &str) -> Result<Resp
     html_response(&layout(
         &format!("Commit {}", &hash[..7.min(hash.len())]),
         repo_name,
+        &default_branch,
         &html,
     ))
 }
@@ -887,7 +1025,7 @@ pub fn page_search(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Respo
         }
     }
 
-    html_response(&layout("Search", repo_name, &html))
+    html_response(&layout("Search", repo_name, &default_branch, &html))
 }
 
 // ---------------------------------------------------------------------------

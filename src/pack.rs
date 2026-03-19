@@ -188,33 +188,76 @@ pub fn resolve_type(
     }
 }
 
+/// Bounded cache for resolved pack entries.  Avoids re-decompressing shared
+/// delta chain bases — critical for git packs with deep chains (up to 50).
+/// Keyed by entry index.  Bounded by entry count (~20-30 MB at 1024 entries).
+pub struct ResolveCache {
+    entries: HashMap<usize, (ObjectType, Vec<u8>)>,
+    max_entries: usize,
+}
+
+impl ResolveCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_entries),
+            max_entries,
+        }
+    }
+
+    fn get(&self, idx: usize) -> Option<(ObjectType, &[u8])> {
+        self.entries.get(&idx).map(|(t, d)| (*t, d.as_slice()))
+    }
+
+    fn insert(&mut self, idx: usize, obj_type: ObjectType, data: Vec<u8>) {
+        if self.entries.len() < self.max_entries {
+            self.entries.insert(idx, (obj_type, data));
+        }
+    }
+
+    fn contains(&self, idx: usize) -> bool {
+        self.entries.contains_key(&idx)
+    }
+}
+
 /// Resolve a single pack entry into its final (type, data) by decompressing
 /// from the pack bytes and applying any delta chain.
 ///
-/// For OFS_DELTA chains, the base is found via `offset_to_idx`.
-/// For REF_DELTA, `hash_to_idx` is consulted (populated incrementally during
-/// processing). Only one resolved object is held in memory at a time (plus
-/// one delta instruction buffer during application).
+/// Uses `cache` to avoid re-decompressing shared delta chain bases.  All
+/// resolved entries (bases and intermediates) are cached up to the cache
+/// capacity, so subsequent entries sharing the same base chain hit the cache
+/// instead of re-decompressing from the pack bytes.
 pub fn resolve_entry(
     data: &[u8],
     index: &[PackEntryMeta],
     offset_to_idx: &HashMap<usize, usize>,
     entry_idx: usize,
     hash_to_idx: &HashMap<String, usize>,
+    cache: &mut ResolveCache,
 ) -> Result<(ObjectType, Vec<u8>)> {
+    // Check cache for exact entry
+    if let Some((obj_type, cached)) = cache.get(entry_idx) {
+        return Ok((obj_type, cached.to_vec()));
+    }
+
     let entry = &index[entry_idx];
 
-    // Non-delta: just decompress
+    // Non-delta: decompress, cache, return
     if let Some(obj_type) = ObjectType::from_type_num(entry.type_num) {
         let (decompressed, _) = zlib_decompress(data, entry.data_offset)?;
+        cache.insert(entry_idx, obj_type, decompressed.clone());
         return Ok((obj_type, decompressed));
     }
 
-    // Delta: walk chain to non-delta base, collecting delta entry indices
+    // Delta: walk chain, stopping early if we hit a cached entry
     let mut chain: Vec<usize> = Vec::new();
     let mut current = entry_idx;
 
     loop {
+        // Check if this entry is already resolved in cache
+        if cache.contains(current) && current != entry_idx {
+            break; // use cached entry as base
+        }
+
         let e = &index[current];
         match e.type_num {
             1..=4 => break, // found non-delta base
@@ -249,15 +292,22 @@ pub fn resolve_entry(
         }
     }
 
-    // Decompress the non-delta base
-    let base_type = ObjectType::from_type_num(index[current].type_num)
-        .ok_or_else(|| ParseError(format!("invalid base type {}", index[current].type_num)))?;
-    let (mut result, _) = zlib_decompress(data, index[current].data_offset)?;
+    // Resolve base — from cache or by decompression
+    let (base_type, mut result) = if let Some((t, d)) = cache.get(current) {
+        (t, d.to_vec())
+    } else {
+        let t = ObjectType::from_type_num(index[current].type_num)
+            .ok_or_else(|| ParseError(format!("invalid base type {}", index[current].type_num)))?;
+        let (decompressed, _) = zlib_decompress(data, index[current].data_offset)?;
+        cache.insert(current, t, decompressed.clone());
+        (t, decompressed)
+    };
 
-    // Apply deltas from innermost (closest to base) to outermost (entry_idx)
+    // Apply deltas from innermost to outermost, caching each intermediate
     for &delta_idx in chain.iter().rev() {
         let (delta_data, _) = zlib_decompress(data, index[delta_idx].data_offset)?;
         result = apply_git_delta(&result, &delta_data)?;
+        cache.insert(delta_idx, base_type, result.clone());
     }
 
     Ok((base_type, result))

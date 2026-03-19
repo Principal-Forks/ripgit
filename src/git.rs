@@ -40,6 +40,11 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     }
 
     // --- 2-7. Process pack data (streaming) ---
+    // Note: Cloudflare DO SQLite does not support BEGIN/COMMIT via sql.exec().
+    // transactionSync() is not available in workers-rs 0.7.5.
+    // Each sql.exec() auto-commits individually. If the DO times out mid-push,
+    // partial state may result. Use the admin/set-ref endpoint to recover.
+    // TODO: look into getting transaction support in workers-rs
     let pack_data = &body[pack_offset..];
     if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
         process_pack_streaming(sql, pack_data)?;
@@ -102,9 +107,11 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
         .map(|i| pack::resolve_type(&index, &offset_to_idx, i))
         .collect();
 
-    // hash_to_idx: populated incrementally for REF_DELTA support.
-    // For OFS_DELTA (the common case in push packs), this is unused.
     let mut hash_to_idx: HashMap<String, usize> = HashMap::new();
+
+    // Resolve cache: avoids re-decompressing shared delta chain bases.
+    // 1024 entries ≈ 20-30 MB, well within DO's 128 MB memory limit.
+    let mut cache = pack::ResolveCache::new(1024);
 
     // --- Process commits ---
     let mut root_tree_hashes: Vec<String> = Vec::new();
@@ -113,15 +120,21 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
         if types[i] != Some(pack::ObjectType::Commit) {
             continue;
         }
-        let (_, data) = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx)
-            .map_err(|e| Error::RustError(e.0))?;
+        let (_, data) = pack::resolve_entry(
+            pack_data,
+            &index,
+            &offset_to_idx,
+            i,
+            &hash_to_idx,
+            &mut cache,
+        )
+        .map_err(|e| Error::RustError(e.0))?;
         let hash = pack::hash_object(&pack::ObjectType::Commit, &data);
         hash_to_idx.insert(hash.clone(), i);
         let parsed = store::parse_commit(&data)
             .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
         root_tree_hashes.push(parsed.tree_hash.clone());
         store::store_commit(sql, &hash, &parsed, &data)?;
-        // `data` is dropped here
     }
 
     // --- Process trees ---
@@ -129,8 +142,15 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
         if types[i] != Some(pack::ObjectType::Tree) {
             continue;
         }
-        let (_, data) = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx)
-            .map_err(|e| Error::RustError(e.0))?;
+        let (_, data) = pack::resolve_entry(
+            pack_data,
+            &index,
+            &offset_to_idx,
+            i,
+            &hash_to_idx,
+            &mut cache,
+        )
+        .map_err(|e| Error::RustError(e.0))?;
         let hash = pack::hash_object(&pack::ObjectType::Tree, &data);
         hash_to_idx.insert(hash.clone(), i);
         store::store_tree(sql, &hash, &data)?;
@@ -145,8 +165,15 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
         if types[i] != Some(pack::ObjectType::Blob) {
             continue;
         }
-        let (_, data) = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx)
-            .map_err(|e| Error::RustError(e.0))?;
+        let (_, data) = pack::resolve_entry(
+            pack_data,
+            &index,
+            &offset_to_idx,
+            i,
+            &hash_to_idx,
+            &mut cache,
+        )
+        .map_err(|e| Error::RustError(e.0))?;
         let hash = pack::hash_object(&pack::ObjectType::Blob, &data);
         hash_to_idx.insert(hash.clone(), i);
         let path = blob_paths
@@ -157,13 +184,18 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
     }
 
     // --- Handle REF_DELTA entries with unknown types ---
-    // These are rare in push packs (git prefers OFS_DELTA). Process any that
-    // remain after the main passes.
     for i in 0..index.len() {
         if types[i].is_some() {
-            continue; // already handled
+            continue;
         }
-        let resolved = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx);
+        let resolved = pack::resolve_entry(
+            pack_data,
+            &index,
+            &offset_to_idx,
+            i,
+            &hash_to_idx,
+            &mut cache,
+        );
         match resolved {
             Ok((obj_type, data)) => {
                 let hash = pack::hash_object(&obj_type, &data);
@@ -184,13 +216,10 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
                             .unwrap_or("unknown");
                         store::store_blob(sql, &hash, &data, path, KEYFRAME_INTERVAL)?;
                     }
-                    pack::ObjectType::Tag => {} // skip
+                    pack::ObjectType::Tag => {}
                 }
             }
-            Err(_) => {
-                // Unresolvable entry (e.g. thin pack base not available).
-                // Skip silently — this is a known limitation.
-            }
+            Err(_) => {}
         }
     }
 

@@ -7,6 +7,9 @@ use worker::*;
 
 pub const ZERO_HASH: &str = "0000000000000000000000000000000000000000";
 
+/// Cloudflare DO SQLite limit: 2 MB per row. We stay safely under it.
+const MAX_BLOB_ROW_SIZE: usize = 1_900_000;
+
 // ---------------------------------------------------------------------------
 // Parsed types
 // ---------------------------------------------------------------------------
@@ -43,7 +46,10 @@ pub struct TreeEntry {
 ///   \n
 ///   <message>
 pub fn parse_commit(data: &[u8]) -> std::result::Result<ParsedCommit, String> {
-    let text = std::str::from_utf8(data).map_err(|e| format!("commit not UTF-8: {}", e))?;
+    // Lossy conversion: old commits may use Latin-1 or other encodings for
+    // author names. The raw bytes are preserved in raw_objects for fetch;
+    // we only need displayable strings for the parsed commits table.
+    let text = String::from_utf8_lossy(data).into_owned();
 
     let mut tree_hash = String::new();
     let mut parents = Vec::new();
@@ -57,7 +63,7 @@ pub fn parse_commit(data: &[u8]) -> std::result::Result<ParsedCommit, String> {
     // Split at the first blank line: headers vs message body
     let (header_block, message) = match text.find("\n\n") {
         Some(pos) => (&text[..pos], text[pos + 2..].to_string()),
-        None => (text, String::new()),
+        None => (text.as_str(), String::new()),
     };
 
     for line in header_block.lines() {
@@ -179,18 +185,19 @@ pub fn parse_tree_data(data: &[u8]) -> std::result::Result<Vec<TreeEntry>, Strin
 /// Store a parsed commit, its parent edges, and the raw object bytes.
 /// Skips if already stored.
 pub fn store_commit(sql: &SqlStorage, hash: &str, c: &ParsedCommit, raw_data: &[u8]) -> Result<()> {
-    // Dedup: skip if commit already exists
+    // Fast existence check: indexed PK lookup, single row
     #[derive(serde::Deserialize)]
-    struct Count {
-        n: i64,
+    #[allow(dead_code)]
+    struct Exists {
+        x: i64,
     }
-    let existing: Count = sql
+    let exists: Vec<Exists> = sql
         .exec(
-            "SELECT COUNT(*) AS n FROM commits WHERE hash = ?",
+            "SELECT 1 AS x FROM commits WHERE hash = ? LIMIT 1",
             vec![SqlStorageValue::from(hash.to_string())],
         )?
-        .one()?;
-    if existing.n > 0 {
+        .to_array()?;
+    if !exists.is_empty() {
         return Ok(());
     }
 
@@ -212,16 +219,20 @@ pub fn store_commit(sql: &SqlStorage, hash: &str, c: &ParsedCommit, raw_data: &[
         ],
     )?;
 
-    for (i, parent) in c.parents.iter().enumerate() {
-        sql.exec(
-            "INSERT INTO commit_parents (commit_hash, parent_hash, ordinal)
-             VALUES (?, ?, ?)",
-            vec![
-                SqlStorageValue::from(hash.to_string()),
-                SqlStorageValue::from(parent.clone()),
-                SqlStorageValue::from(i as i64),
-            ],
-        )?;
+    // Batch parent inserts: up to 33 parents per statement (3 params each, 100 max)
+    for chunk in c.parents.chunks(33) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "(?, ?, ?)").collect();
+        let sql_str = format!(
+            "INSERT INTO commit_parents (commit_hash, parent_hash, ordinal) VALUES {}",
+            placeholders.join(", ")
+        );
+        let mut params = Vec::new();
+        for (i, parent) in chunk.iter().enumerate() {
+            params.push(SqlStorageValue::from(hash.to_string()));
+            params.push(SqlStorageValue::from(parent.clone()));
+            params.push(SqlStorageValue::from(i as i64));
+        }
+        sql.exec(&sql_str, params)?;
     }
 
     // Store raw bytes for byte-identical fetch
@@ -341,33 +352,39 @@ fn build_commit_graph(
 
 /// Store tree entries. Skips if tree already exists.
 pub fn store_tree(sql: &SqlStorage, tree_hash: &str, data: &[u8]) -> Result<()> {
+    // Fast existence check: indexed PK lookup, single row
     #[derive(serde::Deserialize)]
-    struct Count {
-        n: i64,
+    #[allow(dead_code)]
+    struct Exists {
+        x: i64,
     }
-    let existing: Count = sql
+    let exists: Vec<Exists> = sql
         .exec(
-            "SELECT COUNT(*) AS n FROM trees WHERE tree_hash = ?",
+            "SELECT 1 AS x FROM trees WHERE tree_hash = ? LIMIT 1",
             vec![SqlStorageValue::from(tree_hash.to_string())],
         )?
-        .one()?;
-    if existing.n > 0 {
+        .to_array()?;
+    if !exists.is_empty() {
         return Ok(());
     }
 
     let entries = parse_tree_data(data).map_err(|e| Error::RustError(e))?;
 
-    for entry in &entries {
-        sql.exec(
-            "INSERT OR IGNORE INTO trees (tree_hash, name, mode, entry_hash)
-             VALUES (?, ?, ?, ?)",
-            vec![
-                SqlStorageValue::from(tree_hash.to_string()),
-                SqlStorageValue::from(entry.name.clone()),
-                SqlStorageValue::from(entry.mode as i64),
-                SqlStorageValue::from(entry.hash.clone()),
-            ],
-        )?;
+    // Batch INSERTs: 25 entries per statement (4 params each, 100 max)
+    for chunk in entries.chunks(25) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "(?, ?, ?, ?)").collect();
+        let sql_str = format!(
+            "INSERT OR IGNORE INTO trees (tree_hash, name, mode, entry_hash) VALUES {}",
+            placeholders.join(", ")
+        );
+        let mut params = Vec::new();
+        for entry in chunk {
+            params.push(SqlStorageValue::from(tree_hash.to_string()));
+            params.push(SqlStorageValue::from(entry.name.clone()));
+            params.push(SqlStorageValue::from(entry.mode as i64));
+            params.push(SqlStorageValue::from(entry.hash.clone()));
+        }
+        sql.exec(&sql_str, params)?;
     }
 
     // Store raw bytes for byte-identical fetch
@@ -385,18 +402,19 @@ pub fn store_blob(
     path: &str,
     keyframe_interval: i64,
 ) -> Result<()> {
-    // Dedup: skip if blob already stored
+    // Fast existence check: indexed PK lookup
     #[derive(serde::Deserialize)]
-    struct Count {
-        n: i64,
+    #[allow(dead_code)]
+    struct Exists {
+        x: i64,
     }
-    let existing: Count = sql
+    let exists: Vec<Exists> = sql
         .exec(
-            "SELECT COUNT(*) AS n FROM blobs WHERE blob_hash = ?",
+            "SELECT 1 AS x FROM blobs WHERE blob_hash = ? LIMIT 1",
             vec![SqlStorageValue::from(hash.to_string())],
         )?
-        .one()?;
-    if existing.n > 0 {
+        .to_array()?;
+    if !exists.is_empty() {
         return Ok(());
     }
 
@@ -435,26 +453,65 @@ pub fn store_blob(
     let is_keyframe = new_version == 1 || (new_version % keyframe_interval == 1);
 
     let stored_data = if is_keyframe {
-        raw_data.to_vec()
+        // Compress keyframes with zlib to reduce storage and stay under
+        // the 2 MB per-row DO SQLite limit for most files.
+        blob_zlib_compress(raw_data)
     } else {
-        // Reconstruct the latest version and delta-encode against it
+        // Reconstruct the latest version and delta-encode against it.
+        // Deltas are already compact (xpatch uses zstd internally).
         let prev = reconstruct_blob(sql, group_id, latest_version)?;
         xpatch::delta::encode(0, &prev, raw_data, true)
     };
 
-    sql.exec(
-        "INSERT INTO blobs
-            (blob_hash, group_id, version_in_group, is_keyframe, data, raw_size)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        vec![
-            SqlStorageValue::from(hash.to_string()),
-            SqlStorageValue::from(group_id),
-            SqlStorageValue::from(new_version),
-            SqlStorageValue::from(if is_keyframe { 1i64 } else { 0i64 }),
-            SqlStorageValue::Blob(stored_data),
-            SqlStorageValue::from(raw_data.len() as i64),
-        ],
-    )?;
+    let stored_len = stored_data.len() as i64;
+
+    if stored_data.len() <= MAX_BLOB_ROW_SIZE {
+        // Fits in a single row
+        sql.exec(
+            "INSERT INTO blobs
+                (blob_hash, group_id, version_in_group, is_keyframe, data, raw_size, stored_size)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(hash.to_string()),
+                SqlStorageValue::from(group_id),
+                SqlStorageValue::from(new_version),
+                SqlStorageValue::from(if is_keyframe { 1i64 } else { 0i64 }),
+                SqlStorageValue::Blob(stored_data),
+                SqlStorageValue::from(raw_data.len() as i64),
+                SqlStorageValue::from(stored_len),
+            ],
+        )?;
+    } else {
+        // Too large for one row even after compression — store empty
+        // sentinel in blobs and actual data in blob_chunks.
+        sql.exec(
+            "INSERT INTO blobs
+                (blob_hash, group_id, version_in_group, is_keyframe, data, raw_size, stored_size)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(hash.to_string()),
+                SqlStorageValue::from(group_id),
+                SqlStorageValue::from(new_version),
+                SqlStorageValue::from(if is_keyframe { 1i64 } else { 0i64 }),
+                SqlStorageValue::Blob(Vec::new()), // empty sentinel
+                SqlStorageValue::from(raw_data.len() as i64),
+                SqlStorageValue::from(stored_len),
+            ],
+        )?;
+        for (i, chunk) in stored_data.chunks(MAX_BLOB_ROW_SIZE).enumerate() {
+            sql.exec(
+                "INSERT INTO blob_chunks
+                    (group_id, version_in_group, chunk_index, data)
+                 VALUES (?, ?, ?, ?)",
+                vec![
+                    SqlStorageValue::from(group_id),
+                    SqlStorageValue::from(new_version),
+                    SqlStorageValue::from(i as i64),
+                    SqlStorageValue::Blob(chunk.to_vec()),
+                ],
+            )?;
+        }
+    }
 
     sql.exec(
         "UPDATE blob_groups SET latest_version = ? WHERE group_id = ?",
@@ -494,7 +551,14 @@ pub fn reconstruct_blob(sql: &SqlStorage, group_id: i64, target_version: i64) ->
         .ok_or_else(|| Error::RustError("no keyframe found in blob group".into()))?;
 
     let keyframe_version = keyframe.version_in_group;
-    let mut content = keyframe.data;
+
+    // Reassemble chunked data if the sentinel is empty, then decompress.
+    let compressed = if keyframe.data.is_empty() {
+        reassemble_chunks(sql, group_id, keyframe_version)?
+    } else {
+        keyframe.data
+    };
+    let mut content = blob_zlib_decompress(&compressed)?;
 
     if keyframe_version < target_version {
         let cursor = sql.exec(
@@ -1225,4 +1289,59 @@ fn search_files_literal(
 
     let rows: Vec<Row> = sql.exec(&sql_str, params)?.to_array()?;
     Ok(rows.into_iter().map(|r| (r.path, r.content)).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Blob compression helpers
+// ---------------------------------------------------------------------------
+
+/// Zlib-compress data (used for keyframe storage).
+fn blob_zlib_compress(data: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("zlib compress write");
+    encoder.finish().expect("zlib compress finish")
+}
+
+/// Zlib-decompress data (used when reading keyframes).
+fn blob_zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    let mut decoder = ZlibDecoder::new(data);
+    let mut output = Vec::new();
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|e| Error::RustError(format!("blob zlib decompress: {}", e)))?;
+    Ok(output)
+}
+
+/// Reassemble a chunked blob from the blob_chunks table.
+fn reassemble_chunks(sql: &SqlStorage, group_id: i64, version: i64) -> Result<Vec<u8>> {
+    #[derive(serde::Deserialize)]
+    struct ChunkRow {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    }
+
+    let cursor = sql.exec(
+        "SELECT data FROM blob_chunks
+         WHERE group_id = ? AND version_in_group = ?
+         ORDER BY chunk_index ASC",
+        vec![
+            SqlStorageValue::from(group_id),
+            SqlStorageValue::from(version),
+        ],
+    )?;
+
+    let mut result = Vec::new();
+    for row in cursor.next::<ChunkRow>() {
+        let row = row?;
+        result.extend_from_slice(&row.data);
+    }
+
+    Ok(result)
 }

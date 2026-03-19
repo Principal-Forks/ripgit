@@ -404,7 +404,7 @@ pub fn handle_stats(sql: &SqlStorage) -> Result<Response> {
     let blob_stats: Vec<BlobStats> = sql
         .exec(
             "SELECT
-                COALESCE(SUM(LENGTH(data)), 0) AS total_stored,
+                COALESCE(SUM(stored_size), 0) AS total_stored,
                 COALESCE(SUM(raw_size), 0) AS total_raw,
                 COALESCE(SUM(is_keyframe), 0) AS keyframes
              FROM blobs",

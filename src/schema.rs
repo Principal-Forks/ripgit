@@ -80,11 +80,27 @@ pub fn init(sql: &SqlStorage) {
             is_keyframe      INTEGER NOT NULL DEFAULT 0,
             data             BLOB NOT NULL,
             raw_size         INTEGER NOT NULL,
+            stored_size      INTEGER NOT NULL DEFAULT 0,
             UNIQUE (group_id, version_in_group)
         )",
         None,
     )
     .expect("create blobs");
+
+    // Overflow table for blobs whose compressed data exceeds the 2 MB
+    // per-row SQLite limit in Cloudflare DOs.  The blobs table stores an
+    // empty sentinel for the data column; actual bytes live here in chunks.
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS blob_chunks (
+            group_id         INTEGER NOT NULL,
+            version_in_group INTEGER NOT NULL,
+            chunk_index      INTEGER NOT NULL,
+            data             BLOB NOT NULL,
+            PRIMARY KEY (group_id, version_in_group, chunk_index)
+        )",
+        None,
+    )
+    .expect("create blob_chunks");
 
     // Raw object bytes for commits and trees. Stored verbatim so we can
     // return them byte-for-byte identical during fetch (preserving timezone,

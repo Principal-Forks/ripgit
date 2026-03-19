@@ -103,6 +103,23 @@ impl DurableObject for Repository {
                 git::handle_upload_pack(&self.sql, &body)
             }
 
+            // -- Delete all data (for testing) --
+            (Method::Delete, "") => {
+                self.sql.exec("DELETE FROM blobs", None)?;
+                self.sql.exec("DELETE FROM blob_chunks", None)?;
+                self.sql.exec("DELETE FROM blob_groups", None)?;
+                self.sql.exec("DELETE FROM trees", None)?;
+                self.sql.exec("DELETE FROM commits", None)?;
+                self.sql.exec("DELETE FROM commit_parents", None)?;
+                self.sql.exec("DELETE FROM commit_graph", None)?;
+                self.sql.exec("DELETE FROM raw_objects", None)?;
+                self.sql.exec("DELETE FROM refs", None)?;
+                self.sql.exec("DELETE FROM config", None)?;
+                self.sql.exec("DELETE FROM fts_head", None)?;
+                self.sql.exec("DELETE FROM fts_commits", None)?;
+                Response::ok("deleted")
+            }
+
             // -- JSON API (always JSON) --
             (Method::Get, "refs") => api::handle_refs(&self.sql),
             (Method::Get, "file") => api::handle_file(&self.sql, &url),

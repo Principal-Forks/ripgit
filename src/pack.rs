@@ -65,6 +65,9 @@ pub struct PackEntryMeta {
     pub data_offset: usize,
     /// Raw type number: 1=commit, 2=tree, 3=blob, 4=tag, 6=ofs_delta, 7=ref_delta.
     pub type_num: u8,
+    /// Decompressed size from the pack header. For non-delta entries this is
+    /// the final object size; for deltas it's the delta payload size.
+    pub size: usize,
     /// For OFS_DELTA (type 6): absolute byte offset of the base entry in the pack.
     pub base_pack_offset: Option<usize>,
     /// For REF_DELTA (type 7): hex SHA-1 hash of the base object.
@@ -114,7 +117,7 @@ pub fn build_index(data: &[u8]) -> Result<(Vec<PackEntryMeta>, HashMap<usize, us
 
     for _i in 0..num_objects {
         let entry_offset = pos;
-        let (type_num, _size, header_len) = read_type_and_size(data, pos)?;
+        let (type_num, size, header_len) = read_type_and_size(data, pos)?;
         pos += header_len;
 
         let mut base_pack_offset = None;
@@ -157,6 +160,7 @@ pub fn build_index(data: &[u8]) -> Result<(Vec<PackEntryMeta>, HashMap<usize, us
         index.push(PackEntryMeta {
             data_offset,
             type_num,
+            size,
             base_pack_offset,
             base_hash,
         });
@@ -208,14 +212,27 @@ impl ResolveCache {
         self.entries.get(&idx).map(|(t, d)| (*t, d.as_slice()))
     }
 
-    fn insert(&mut self, idx: usize, obj_type: ObjectType, data: Vec<u8>) {
-        if self.entries.len() < self.max_entries {
-            self.entries.insert(idx, (obj_type, data));
+    /// Maximum size of a single cached entry (10 MB). Entries larger than
+    /// this are not cached — they'd consume too much of the 128 MB DO memory
+    /// budget. Large blobs (e.g. 87 MB pickle files) are unlikely to be delta
+    /// bases for other pack entries.
+    const MAX_ENTRY_SIZE: usize = 10_000_000;
+
+    /// Cache an entry only if it's small enough and there's room. Clones the
+    /// data only when actually caching — zero-copy for large entries.
+    fn try_cache(&mut self, idx: usize, obj_type: ObjectType, data: &[u8]) {
+        if self.entries.len() < self.max_entries && data.len() <= Self::MAX_ENTRY_SIZE {
+            self.entries.insert(idx, (obj_type, data.to_vec()));
         }
     }
 
     fn contains(&self, idx: usize) -> bool {
         self.entries.contains_key(&idx)
+    }
+
+    /// Drop all cached entries to reclaim memory.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 
@@ -226,6 +243,12 @@ impl ResolveCache {
 /// resolved entries (bases and intermediates) are cached up to the cache
 /// capacity, so subsequent entries sharing the same base chain hit the cache
 /// instead of re-decompressing from the pack bytes.
+/// External objects loaded from the database for thin pack resolution.
+/// When a REF_DELTA references an object not in the current pack, it's
+/// looked up here. This handles incremental pushes where git deltifies
+/// trees/blobs against objects from previous pushes.
+pub type ExternalObjects = HashMap<String, (ObjectType, Vec<u8>)>;
+
 pub fn resolve_entry(
     data: &[u8],
     index: &[PackEntryMeta],
@@ -233,6 +256,7 @@ pub fn resolve_entry(
     entry_idx: usize,
     hash_to_idx: &HashMap<String, usize>,
     cache: &mut ResolveCache,
+    external: &ExternalObjects,
 ) -> Result<(ObjectType, Vec<u8>)> {
     // Check cache for exact entry
     if let Some((obj_type, cached)) = cache.get(entry_idx) {
@@ -241,10 +265,10 @@ pub fn resolve_entry(
 
     let entry = &index[entry_idx];
 
-    // Non-delta: decompress, cache, return
+    // Non-delta: decompress and return. Cache only small entries (no clone for large).
     if let Some(obj_type) = ObjectType::from_type_num(entry.type_num) {
-        let (decompressed, _) = zlib_decompress(data, entry.data_offset)?;
-        cache.insert(entry_idx, obj_type, decompressed.clone());
+        let (decompressed, _) = zlib_decompress(data, entry.data_offset, entry.size)?;
+        cache.try_cache(entry_idx, obj_type, &decompressed);
         return Ok((obj_type, decompressed));
     }
 
@@ -279,9 +303,21 @@ pub fn resolve_entry(
                     .base_hash
                     .as_ref()
                     .ok_or_else(|| ParseError("REF_DELTA missing base_hash".into()))?;
-                current = *hash_to_idx
-                    .get(base_hash.as_str())
-                    .ok_or_else(|| ParseError(format!("REF_DELTA base {} not found", base_hash)))?;
+                if let Some(&idx) = hash_to_idx.get(base_hash.as_str()) {
+                    current = idx;
+                } else if external.contains_key(base_hash.as_str()) {
+                    // Base is from a previous push — stop chain walk here,
+                    // we'll use the external object as the base below.
+                    // Don't keep current in chain: the REF_DELTA resolution
+                    // in "Resolve base" already applies this entry's delta.
+                    chain.pop();
+                    break;
+                } else {
+                    return Err(ParseError(format!(
+                        "REF_DELTA base {} not found",
+                        base_hash
+                    )));
+                }
             }
             _ => {
                 return Err(ParseError(format!(
@@ -292,22 +328,39 @@ pub fn resolve_entry(
         }
     }
 
-    // Resolve base — from cache or by decompression
+    // Resolve base — from cache, external objects, or by decompression
     let (base_type, mut result) = if let Some((t, d)) = cache.get(current) {
         (t, d.to_vec())
+    } else if index[current].type_num == 7 {
+        // REF_DELTA whose base is external (from a previous push)
+        let base_hash = index[current]
+            .base_hash
+            .as_ref()
+            .ok_or_else(|| ParseError("REF_DELTA missing base_hash".into()))?;
+        let (obj_type, base_data) = external
+            .get(base_hash.as_str())
+            .ok_or_else(|| ParseError(format!("external base {} not found", base_hash)))?;
+        // Apply this entry's delta on top of the external base
+        let (delta_data, _) =
+            zlib_decompress(data, index[current].data_offset, index[current].size)?;
+        let resolved = apply_git_delta(base_data, &delta_data)?;
+        cache.try_cache(current, *obj_type, &resolved);
+        (*obj_type, resolved)
     } else {
         let t = ObjectType::from_type_num(index[current].type_num)
             .ok_or_else(|| ParseError(format!("invalid base type {}", index[current].type_num)))?;
-        let (decompressed, _) = zlib_decompress(data, index[current].data_offset)?;
-        cache.insert(current, t, decompressed.clone());
+        let (decompressed, _) =
+            zlib_decompress(data, index[current].data_offset, index[current].size)?;
+        cache.try_cache(current, t, &decompressed);
         (t, decompressed)
     };
 
-    // Apply deltas from innermost to outermost, caching each intermediate
+    // Apply deltas from innermost to outermost. Cache only small intermediates.
     for &delta_idx in chain.iter().rev() {
-        let (delta_data, _) = zlib_decompress(data, index[delta_idx].data_offset)?;
+        let (delta_data, _) =
+            zlib_decompress(data, index[delta_idx].data_offset, index[delta_idx].size)?;
         result = apply_git_delta(&result, &delta_data)?;
-        cache.insert(delta_idx, base_type, result.clone());
+        cache.try_cache(delta_idx, base_type, &result);
     }
 
     Ok((base_type, result))
@@ -563,11 +616,20 @@ fn zlib_skip(data: &[u8], pos: usize) -> Result<usize> {
     Ok(decoder.total_in() as usize)
 }
 
+/// Maximum preallocation for zlib decompression output. The `size_hint`
+/// comes from the pack header which is client-controlled — a malicious push
+/// could claim a 4 GB decompressed size for a tiny entry. Capping prevents
+/// input-driven OOM. If the real data exceeds this, Vec grows naturally.
+const MAX_PREALLOC: usize = 100_000_000; // 100 MB
+
 /// Zlib decompress starting at `pos` in `data`.
+/// `size_hint` pre-allocates the output buffer to avoid costly Vec reallocs.
+/// Without this, decompressing an 87 MB blob would double the buffer
+/// repeatedly (64→128 MB), needing 192 MB peak during the copy.
 /// Returns (decompressed_bytes, bytes_consumed_from_input).
-fn zlib_decompress(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize)> {
+fn zlib_decompress(data: &[u8], pos: usize, size_hint: usize) -> Result<(Vec<u8>, usize)> {
     let mut decoder = ZlibDecoder::new(&data[pos..]);
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(size_hint.min(MAX_PREALLOC));
     decoder
         .read_to_end(&mut output)
         .map_err(|e| ParseError(format!("zlib decompression failed: {}", e)))?;

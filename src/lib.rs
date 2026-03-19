@@ -46,6 +46,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 #[durable_object]
 pub struct Repository {
+    state: State,
     sql: SqlStorage,
     #[allow(dead_code)]
     env: Env,
@@ -53,9 +54,10 @@ pub struct Repository {
 
 impl DurableObject for Repository {
     fn new(state: State, env: Env) -> Self {
+        let state = state;
         let sql = state.storage().sql();
         schema::init(&sql);
-        Self { sql, env }
+        Self { sql, env, state }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
@@ -105,18 +107,7 @@ impl DurableObject for Repository {
 
             // -- Delete all data (for testing) --
             (Method::Delete, "") => {
-                self.sql.exec("DELETE FROM blobs", None)?;
-                self.sql.exec("DELETE FROM blob_chunks", None)?;
-                self.sql.exec("DELETE FROM blob_groups", None)?;
-                self.sql.exec("DELETE FROM trees", None)?;
-                self.sql.exec("DELETE FROM commits", None)?;
-                self.sql.exec("DELETE FROM commit_parents", None)?;
-                self.sql.exec("DELETE FROM commit_graph", None)?;
-                self.sql.exec("DELETE FROM raw_objects", None)?;
-                self.sql.exec("DELETE FROM refs", None)?;
-                self.sql.exec("DELETE FROM config", None)?;
-                self.sql.exec("DELETE FROM fts_head", None)?;
-                self.sql.exec("DELETE FROM fts_commits", None)?;
+                self.state.storage().delete_all().await?;
                 Response::ok("deleted")
             }
 
@@ -176,6 +167,116 @@ impl DurableObject for Repository {
                 web::page_blob(&self.sql, repo_name, ref_name, &sub_path)
             }
             (Method::Get, "search-ui") => web::page_search(&self.sql, repo_name, &url),
+
+            // -- Admin endpoints --
+            (Method::Put, "admin") => {
+                let sub = parts.get(3).unwrap_or(&"");
+                match *sub {
+                    "set-ref" => {
+                        let name = url.query_pairs().find(|(k, _)| k == "name").map(|(_, v)| v.to_string());
+                        let hash = url.query_pairs().find(|(k, _)| k == "hash").map(|(_, v)| v.to_string());
+                        match (name, hash) {
+                            (Some(n), Some(h)) => {
+                                self.sql.exec(
+                                    "INSERT INTO refs (name, commit_hash) VALUES (?, ?)
+                                     ON CONFLICT(name) DO UPDATE SET commit_hash = ?",
+                                    vec![
+                                        SqlStorageValue::from(n.clone()),
+                                        SqlStorageValue::from(h.clone()),
+                                        SqlStorageValue::from(h.clone()),
+                                    ],
+                                )?;
+                                Response::ok(format!("{} -> {}", n, h))
+                            }
+                            _ => Response::ok("need ?name=refs/heads/main&hash=abc123"),
+                        }
+                    }
+                    "config" => {
+                        let key = url.query_pairs().find(|(k, _)| k == "key").map(|(_, v)| v.to_string());
+                        let value = url.query_pairs().find(|(k, _)| k == "value").map(|(_, v)| v.to_string());
+                        match (key, value) {
+                            (Some(k), Some(v)) => {
+                                store::set_config(&self.sql, &k, &v)?;
+                                Response::ok(format!("{} = {}", k, v))
+                            }
+                            (Some(k), None) => {
+                                let v = store::get_config(&self.sql, &k)?;
+                                Response::ok(v.unwrap_or_else(|| "(not set)".to_string()))
+                            }
+                            _ => Response::ok("need ?key=name[&value=val]"),
+                        }
+                    }
+                    "rebuild-fts" => {
+                        let default_ref = store::get_config(&self.sql, "default_branch")?
+                            .unwrap_or_else(|| "refs/heads/main".to_string());
+                        #[derive(serde::Deserialize)]
+                        struct RefRow { commit_hash: String }
+                        let rows: Vec<RefRow> = self.sql.exec(
+                            "SELECT commit_hash FROM refs WHERE name = ?",
+                            vec![SqlStorageValue::from(default_ref)],
+                        )?.to_array()?;
+                        if let Some(row) = rows.first() {
+                            store::rebuild_fts_index(&self.sql, &row.commit_hash)?;
+                            Response::ok("fts rebuilt")
+                        } else {
+                            Response::ok("no default branch ref found")
+                        }
+                    }
+                    "rebuild-graph" => {
+                        // Bulk rebuild commit graph using INSERT...SELECT per level.
+                        // ~14 SQL calls for any repo size.
+                        self.sql.exec("DELETE FROM commit_graph", None)?;
+
+                        // Level 0: direct first-parent
+                        self.sql.exec(
+                            "INSERT INTO commit_graph (commit_hash, level, ancestor_hash)
+                             SELECT cp.commit_hash, 0, cp.parent_hash
+                             FROM commit_parents cp WHERE cp.ordinal = 0",
+                            None,
+                        )?;
+
+                        let mut level: i64 = 1;
+                        loop {
+                            let prev = level - 1;
+                            let result = self.sql.exec(
+                                &format!(
+                                    "INSERT INTO commit_graph (commit_hash, level, ancestor_hash)
+                                     SELECT cg.commit_hash, {}, cg2.ancestor_hash
+                                     FROM commit_graph cg
+                                     JOIN commit_graph cg2
+                                       ON cg2.commit_hash = cg.ancestor_hash AND cg2.level = {}
+                                     WHERE cg.level = {}",
+                                    level, prev, prev
+                                ),
+                                None,
+                            )?;
+                            if result.rows_written() == 0 {
+                                break;
+                            }
+                            level += 1;
+                        }
+
+                        Response::ok(format!("commit graph rebuilt ({} levels)", level))
+                    }
+                    "rebuild-fts-commits" => {
+                        // Bulk rebuild fts_commits from all commits
+                        self.sql.exec("DELETE FROM fts_commits", None)?;
+                        self.sql.exec(
+                            "INSERT INTO fts_commits (hash, message, author)
+                             SELECT hash, message, author FROM commits",
+                            None,
+                        )?;
+                        #[derive(serde::Deserialize)]
+                        struct Count { n: i64 }
+                        let rows: Vec<Count> = self.sql.exec(
+                            "SELECT COUNT(*) AS n FROM fts_commits", None
+                        )?.to_array()?;
+                        let n = rows.first().map(|r| r.n).unwrap_or(0);
+                        Response::ok(format!("fts_commits rebuilt ({} entries)", n))
+                    }
+                    _ => Response::error("unknown admin action", 404),
+                }
+            }
 
             _ => Response::error("Not Found", 404),
         }

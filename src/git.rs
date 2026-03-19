@@ -39,6 +39,11 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         return Ok(resp);
     }
 
+    // --- Check bulk mode (skip_fts=1 skips commit graph + FTS indexing) ---
+    let bulk_mode = store::get_config(sql, "skip_fts")?
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     // --- 2-7. Process pack data (streaming) ---
     // Note: Cloudflare DO SQLite does not support BEGIN/COMMIT via sql.exec().
     // transactionSync() is not available in workers-rs 0.7.5.
@@ -47,7 +52,7 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // TODO: look into getting transaction support in workers-rs
     let pack_data = &body[pack_offset..];
     if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
-        process_pack_streaming(sql, pack_data)?;
+        process_pack_streaming(sql, pack_data, bulk_mode)?;
     }
 
     // --- 8. Update refs ---
@@ -68,11 +73,13 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         }
     }
 
-    if let Some(default_ref) = store::get_config(sql, "default_branch")? {
-        for cmd in &commands {
-            if cmd.ref_name == default_ref {
-                if let Some((_, Ok(()))) = results.iter().find(|(r, _)| r == &cmd.ref_name) {
-                    let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+    if !bulk_mode {
+        if let Some(default_ref) = store::get_config(sql, "default_branch")? {
+            for cmd in &commands {
+                if cmd.ref_name == default_ref {
+                    if let Some((_, Ok(()))) = results.iter().find(|(r, _)| r == &cmd.ref_name) {
+                        let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+                    }
                 }
             }
         }
@@ -97,7 +104,7 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
 /// the pack bytes (which stay in memory as the request body), delta chains are
 /// resolved iteratively, and the result is stored in permanent tables then
 /// dropped. Only one resolved object exists in memory at a time.
-fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
+fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -> Result<()> {
     // --- Build lightweight index ---
     let (index, offset_to_idx) = pack::build_index(pack_data).map_err(|e| Error::RustError(e.0))?;
 
@@ -113,6 +120,28 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
     // 1024 entries ≈ 20-30 MB, well within DO's 128 MB memory limit.
     let mut cache = pack::ResolveCache::new(1024);
 
+    // --- Load external bases for thin pack resolution ---
+    // Thin packs use REF_DELTAs referencing objects from previous pushes.
+    // Collect base hashes not in this pack and load from raw_objects
+    // (commits/trees) or reconstruct from the blobs table.
+    let mut external: pack::ExternalObjects = HashMap::new();
+    for entry in &index {
+        if let Some(ref base_hash) = entry.base_hash {
+            if !external.contains_key(base_hash.as_str()) {
+                // Try raw_objects first (commits and trees)
+                if let Ok(Some(raw)) = store::load_raw_object_pub(sql, base_hash) {
+                    let obj_type = store::detect_object_type(sql, base_hash);
+                    external.insert(base_hash.clone(), (obj_type, raw));
+                }
+                // Try blobs table (reconstructed from delta chain)
+                else if let Ok(Some(blob_data)) = store::reconstruct_blob_by_hash(sql, base_hash)
+                {
+                    external.insert(base_hash.clone(), (pack::ObjectType::Blob, blob_data));
+                }
+            }
+        }
+    }
+
     // --- Process commits ---
     let mut root_tree_hashes: Vec<String> = Vec::new();
 
@@ -127,6 +156,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
             i,
             &hash_to_idx,
             &mut cache,
+            &external,
         )
         .map_err(|e| Error::RustError(e.0))?;
         let hash = pack::hash_object(&pack::ObjectType::Commit, &data);
@@ -134,7 +164,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
         let parsed = store::parse_commit(&data)
             .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
         root_tree_hashes.push(parsed.tree_hash.clone());
-        store::store_commit(sql, &hash, &parsed, &data)?;
+        store::store_commit(sql, &hash, &parsed, &data, bulk_mode)?;
     }
 
     // --- Process trees ---
@@ -149,6 +179,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
             i,
             &hash_to_idx,
             &mut cache,
+            &external,
         )
         .map_err(|e| Error::RustError(e.0))?;
         let hash = pack::hash_object(&pack::ObjectType::Tree, &data);
@@ -159,6 +190,11 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
     // --- Resolve blob paths (all trees now in permanent storage) ---
     let empty_pack_trees: HashMap<String, Vec<store::TreeEntry>> = HashMap::new();
     let blob_paths = store::resolve_blob_paths(sql, &empty_pack_trees, &root_tree_hashes)?;
+
+    // Free memory: commit/tree entries in the resolve cache are no longer needed.
+    // This reclaims ~20-30 MB before blob processing, which needs headroom for
+    // keyframe decompression and xpatch delta computation.
+    cache.clear();
 
     // --- Process blobs ---
     for i in 0..index.len() {
@@ -172,6 +208,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
             i,
             &hash_to_idx,
             &mut cache,
+            &external,
         )
         .map_err(|e| Error::RustError(e.0))?;
         let hash = pack::hash_object(&pack::ObjectType::Blob, &data);
@@ -195,6 +232,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
             i,
             &hash_to_idx,
             &mut cache,
+            &external,
         );
         match resolved {
             Ok((obj_type, data)) => {
@@ -204,7 +242,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
                     pack::ObjectType::Commit => {
                         let parsed = store::parse_commit(&data)
                             .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
-                        store::store_commit(sql, &hash, &parsed, &data)?;
+                        store::store_commit(sql, &hash, &parsed, &data, bulk_mode)?;
                     }
                     pack::ObjectType::Tree => {
                         store::store_tree(sql, &hash, &data)?;

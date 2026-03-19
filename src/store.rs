@@ -10,6 +10,11 @@ pub const ZERO_HASH: &str = "0000000000000000000000000000000000000000";
 /// Cloudflare DO SQLite limit: 2 MB per row. We stay safely under it.
 const MAX_BLOB_ROW_SIZE: usize = 1_900_000;
 
+/// Blobs larger than this skip zlib/xpatch and are stored raw + chunked.
+/// Keeps peak memory well within the 128 MB DO limit (pack body + raw blob
+/// + working memory must all fit). 50 MB is conservative.
+const MAX_COMPRESS_SIZE: usize = 50_000_000;
+
 // ---------------------------------------------------------------------------
 // Parsed types
 // ---------------------------------------------------------------------------
@@ -157,8 +162,7 @@ pub fn parse_tree_data(data: &[u8]) -> std::result::Result<Vec<TreeEntry>, Strin
             .iter()
             .position(|&b| b == 0)
             .ok_or("tree: missing NUL after name")?;
-        let name = std::str::from_utf8(&data[pos..pos + nul_pos])
-            .map_err(|e| format!("tree name: {}", e))?;
+        let name = String::from_utf8_lossy(&data[pos..pos + nul_pos]);
         pos += nul_pos + 1;
 
         // 20-byte raw SHA-1
@@ -183,8 +187,15 @@ pub fn parse_tree_data(data: &[u8]) -> std::result::Result<Vec<TreeEntry>, Strin
 // ---------------------------------------------------------------------------
 
 /// Store a parsed commit, its parent edges, and the raw object bytes.
-/// Skips if already stored.
-pub fn store_commit(sql: &SqlStorage, hash: &str, c: &ParsedCommit, raw_data: &[u8]) -> Result<()> {
+/// Skips if already stored. When `bulk_mode` is true, skips commit graph
+/// building and fts_commits indexing (rebuild via admin endpoints after).
+pub fn store_commit(
+    sql: &SqlStorage,
+    hash: &str,
+    c: &ParsedCommit,
+    raw_data: &[u8],
+    bulk_mode: bool,
+) -> Result<()> {
     // Fast existence check: indexed PK lookup, single row
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
@@ -238,18 +249,20 @@ pub fn store_commit(sql: &SqlStorage, hash: &str, c: &ParsedCommit, raw_data: &[
     // Store raw bytes for byte-identical fetch
     store_raw_object(sql, hash, raw_data)?;
 
-    // Build binary lifting table
-    build_commit_graph(sql, hash, c.parents.first().map(|s| s.as_str()))?;
+    if !bulk_mode {
+        // Build binary lifting table
+        build_commit_graph(sql, hash, c.parents.first().map(|s| s.as_str()))?;
 
-    // Index commit message for FTS search
-    sql.exec(
-        "INSERT OR IGNORE INTO fts_commits (hash, message, author) VALUES (?, ?, ?)",
-        vec![
-            SqlStorageValue::from(hash.to_string()),
-            SqlStorageValue::from(c.message.clone()),
-            SqlStorageValue::from(c.author.clone()),
-        ],
-    )?;
+        // Index commit message for FTS search
+        sql.exec(
+            "INSERT OR IGNORE INTO fts_commits (hash, message, author) VALUES (?, ?, ?)",
+            vec![
+                SqlStorageValue::from(hash.to_string()),
+                SqlStorageValue::from(c.message.clone()),
+                SqlStorageValue::from(c.author.clone()),
+            ],
+        )?;
+    }
 
     Ok(())
 }
@@ -268,6 +281,79 @@ fn load_raw_object(sql: &SqlStorage, hash: &str) -> Result<Option<Vec<u8>>> {
         )?
         .to_array()?;
     Ok(rows.into_iter().next().map(|r| r.data))
+}
+
+/// Load raw object bytes — public wrapper for thin pack resolution.
+pub fn load_raw_object_pub(sql: &SqlStorage, hash: &str) -> Result<Option<Vec<u8>>> {
+    load_raw_object(sql, hash)
+}
+
+/// Reconstruct a blob by hash for thin pack resolution. Looks up the blob's
+/// group and version, then reconstructs from the delta chain.
+/// Returns None if the hash isn't in the blobs table.
+pub fn reconstruct_blob_by_hash(sql: &SqlStorage, hash: &str) -> Result<Option<Vec<u8>>> {
+    #[derive(serde::Deserialize)]
+    struct BlobInfo {
+        group_id: i64,
+        version_in_group: i64,
+    }
+    let rows: Vec<BlobInfo> = sql
+        .exec(
+            "SELECT group_id, version_in_group FROM blobs WHERE blob_hash = ? LIMIT 1",
+            vec![SqlStorageValue::from(hash.to_string())],
+        )?
+        .to_array()?;
+    match rows.into_iter().next() {
+        Some(info) => Ok(Some(reconstruct_blob(
+            sql,
+            info.group_id,
+            info.version_in_group,
+        )?)),
+        None => Ok(None),
+    }
+}
+
+/// Detect the git object type by checking which table contains the hash.
+/// More reliable than parsing raw bytes (which can have edge cases).
+pub fn detect_object_type(sql: &SqlStorage, hash: &str) -> crate::pack::ObjectType {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Exists {
+        x: i64,
+    }
+
+    let in_commits: bool = sql
+        .exec(
+            "SELECT 1 AS x FROM commits WHERE hash = ? LIMIT 1",
+            vec![SqlStorageValue::from(hash.to_string())],
+        )
+        .map(|c| {
+            c.to_array::<Exists>()
+                .map(|r| !r.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if in_commits {
+        return crate::pack::ObjectType::Commit;
+    }
+
+    let in_trees: bool = sql
+        .exec(
+            "SELECT 1 AS x FROM trees WHERE tree_hash = ? LIMIT 1",
+            vec![SqlStorageValue::from(hash.to_string())],
+        )
+        .map(|c| {
+            c.to_array::<Exists>()
+                .map(|r| !r.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if in_trees {
+        return crate::pack::ObjectType::Tree;
+    }
+
+    // Blobs aren't stored in raw_objects, but default to Blob as fallback
+    crate::pack::ObjectType::Blob
 }
 
 /// Store raw object bytes (for commits and trees) so we can return them
@@ -450,6 +536,47 @@ pub fn store_blob(
     };
 
     let new_version = latest_version + 1;
+
+    // Large blobs: store raw + chunked, no compression. Avoids OOM from
+    // zlib/xpatch needing 2x blob size in memory. is_keyframe=2 marks raw.
+    if raw_data.len() > MAX_COMPRESS_SIZE {
+        let raw_len = raw_data.len() as i64;
+        sql.exec(
+            "INSERT INTO blobs
+                (blob_hash, group_id, version_in_group, is_keyframe, data, raw_size, stored_size)
+             VALUES (?, ?, ?, 2, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(hash.to_string()),
+                SqlStorageValue::from(group_id),
+                SqlStorageValue::from(new_version),
+                SqlStorageValue::Blob(Vec::new()), // empty sentinel — data in chunks
+                SqlStorageValue::from(raw_len),
+                SqlStorageValue::from(raw_len),
+            ],
+        )?;
+        for (i, chunk) in raw_data.chunks(MAX_BLOB_ROW_SIZE).enumerate() {
+            sql.exec(
+                "INSERT INTO blob_chunks
+                    (group_id, version_in_group, chunk_index, data)
+                 VALUES (?, ?, ?, ?)",
+                vec![
+                    SqlStorageValue::from(group_id),
+                    SqlStorageValue::from(new_version),
+                    SqlStorageValue::from(i as i64),
+                    SqlStorageValue::Blob(chunk.to_vec()),
+                ],
+            )?;
+        }
+        sql.exec(
+            "UPDATE blob_groups SET latest_version = ? WHERE group_id = ?",
+            vec![
+                SqlStorageValue::from(new_version),
+                SqlStorageValue::from(group_id),
+            ],
+        )?;
+        return Ok(());
+    }
+
     let is_keyframe = new_version == 1 || (new_version % keyframe_interval == 1);
 
     let stored_data = if is_keyframe {
@@ -533,11 +660,21 @@ pub fn reconstruct_blob(sql: &SqlStorage, group_id: i64, target_version: i64) ->
         data: Vec<u8>,
     }
 
-    // Find nearest keyframe
-    let mut keyframes: Vec<BlobRow> = sql
+    // Check if the target version is a raw keyframe (is_keyframe=2).
+    // These are large blobs stored without compression — return directly.
+    #[derive(serde::Deserialize)]
+    struct KeyframeInfo {
+        version_in_group: i64,
+        is_keyframe: i64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    }
+
+    // Find nearest keyframe (is_keyframe IN (1,2))
+    let mut keyframes: Vec<KeyframeInfo> = sql
         .exec(
-            "SELECT version_in_group, data FROM blobs
-             WHERE group_id = ? AND version_in_group <= ? AND is_keyframe = 1
+            "SELECT version_in_group, is_keyframe, data FROM blobs
+             WHERE group_id = ? AND version_in_group <= ? AND is_keyframe >= 1
              ORDER BY version_in_group DESC LIMIT 1",
             vec![
                 SqlStorageValue::from(group_id),
@@ -552,13 +689,23 @@ pub fn reconstruct_blob(sql: &SqlStorage, group_id: i64, target_version: i64) ->
 
     let keyframe_version = keyframe.version_in_group;
 
-    // Reassemble chunked data if the sentinel is empty, then decompress.
-    let compressed = if keyframe.data.is_empty() {
-        reassemble_chunks(sql, group_id, keyframe_version)?
+    // Decompress/reassemble the keyframe based on type.
+    let mut content = if keyframe.is_keyframe == 2 {
+        // Raw keyframe (is_keyframe=2): stored uncompressed in blob_chunks.
+        if keyframe.data.is_empty() {
+            reassemble_chunks(sql, group_id, keyframe_version)?
+        } else {
+            keyframe.data
+        }
     } else {
-        keyframe.data
+        // Normal keyframe (is_keyframe=1): zlib-compressed.
+        let compressed = if keyframe.data.is_empty() {
+            reassemble_chunks(sql, group_id, keyframe_version)?
+        } else {
+            keyframe.data
+        };
+        blob_zlib_decompress(&compressed)?
     };
-    let mut content = blob_zlib_decompress(&compressed)?;
 
     if keyframe_version < target_version {
         let cursor = sql.exec(
@@ -574,7 +721,13 @@ pub fn reconstruct_blob(sql: &SqlStorage, group_id: i64, target_version: i64) ->
 
         for row in cursor.next::<BlobRow>() {
             let row = row?;
-            content = xpatch::delta::decode(&content, &row.data).map_err(|e| {
+            // Reassemble chunked deltas (empty sentinel means data is in blob_chunks)
+            let delta_data = if row.data.is_empty() {
+                reassemble_chunks(sql, group_id, row.version_in_group)?
+            } else {
+                row.data
+            };
+            content = xpatch::delta::decode(&content, &delta_data).map_err(|e| {
                 Error::RustError(format!(
                     "delta decode group {} v{}: {}",
                     group_id, row.version_in_group, e

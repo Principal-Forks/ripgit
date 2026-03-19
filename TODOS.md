@@ -221,5 +221,20 @@ commit info.
   tag refs). Requires a `tag_objects` table + pack parser changes.
 - **Auth** — Bearer token or Cloudflare Access integration.
 - **Force push** — Detect non-fast-forward pushes, handle ref rewrites safely.
+- **Zero-copy resolve cache** — `ResolveCache` currently copies data on both
+  insert and retrieval (`to_vec()` on cache hit). Switch to `Rc<Vec<u8>>`
+  so cache stores shared ownership — "clone" becomes a refcount bump (8
+  bytes, not megabytes). Downstream functions (`store_commit`, `store_tree`,
+  `store_blob`, `hash_object`) should accept `&[u8]` instead of `Vec<u8>`.
+  Currently mitigated by `try_cache` which skips entries >10 MB, but
+  medium-sized entries (1-10 MB) still get copied unnecessarily on cache hits.
+- **Streaming zlib compression** — Currently `blob_zlib_compress` buffers the
+  entire compressed output (2x blob size in memory). Switching to
+  `flate2::write::ZlibEncoder` with incremental chunk writes would eliminate
+  the compressed copy, reducing peak memory from `raw + compressed` to
+  `raw + ~256 KB`. Compression ratio is identical (single continuous zlib
+  stream). Main blocker: interleaves compression with `blob_chunks` INSERT
+  logic, changing the `store_blob` flow. Worth doing for medium-sized blobs
+  (10-50 MB) where the compressed copy is significant.
 - **side-band-64k** — Re-add with proper sideband wrapping for progress
   reporting.

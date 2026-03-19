@@ -13,3 +13,8 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Repository"]
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true

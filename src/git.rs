@@ -10,11 +10,20 @@ use worker::*;
 
 /// Process a git-receive-pack POST request.
 ///
+/// Uses a streaming approach: builds a lightweight index of the pack entries,
+/// then processes objects by type (commits → trees → blobs), decompressing
+/// each entry on-demand from the pack bytes. Only one resolved object is held
+/// in memory at a time, keeping peak memory to pack_size + O(1 object).
+///
 /// 1. Parse pkt-line ref update commands
-/// 2. Parse the pack file
-/// 3. Store all objects (commits, trees, blobs with xpatch delta compression)
-/// 4. Update refs
-/// 5. Return report-status
+/// 2. Build pack index (decompress-to-sink, no data held)
+/// 3. Pre-compute types by following OFS_DELTA chains
+/// 4. Process commits (decompress, store, drop)
+/// 5. Process trees (decompress, store, drop)
+/// 6. Resolve blob paths (all trees now in DB)
+/// 7. Process blobs (decompress, store with xpatch compression, drop)
+/// 8. Update refs
+/// 9. Return report-status
 pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // --- 1. Parse ref update commands from pkt-lines ---
     let (commands, pack_offset) = parse_ref_commands(body);
@@ -30,62 +39,13 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         return Ok(resp);
     }
 
-    // --- 2. Parse pack file (if present) ---
+    // --- 2-7. Process pack data (streaming) ---
     let pack_data = &body[pack_offset..];
-    let objects = if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
-        pack::parse(pack_data).map_err(|e| Error::RustError(e.0))?
-    } else {
-        Vec::new()
-    };
-
-    // --- 3. Store all objects ---
-
-    // Build lookup maps for trees (needed for blob path resolution)
-    let mut pack_trees: HashMap<String, Vec<store::TreeEntry>> = HashMap::new();
-    let mut root_tree_hashes: Vec<String> = Vec::new();
-
-    // First pass: store commits and trees, collect metadata
-    for obj in &objects {
-        match obj.obj_type {
-            pack::ObjectType::Commit => {
-                let parsed = store::parse_commit(&obj.data)
-                    .map_err(|e| Error::RustError(format!("commit {}: {}", obj.hash, e)))?;
-                root_tree_hashes.push(parsed.tree_hash.clone());
-                store::store_commit(sql, &obj.hash, &parsed, &obj.data)?;
-            }
-            pack::ObjectType::Tree => {
-                let entries = store::parse_tree_data(&obj.data)
-                    .map_err(|e| Error::RustError(format!("tree {}: {}", obj.hash, e)))?;
-                pack_trees.insert(obj.hash.clone(), entries);
-                store::store_tree(sql, &obj.hash, &obj.data)?;
-            }
-            _ => {} // blobs and tags handled below
-        }
+    if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
+        process_pack_streaming(sql, pack_data)?;
     }
 
-    // Resolve blob paths by walking commit trees
-    let blob_paths = store::resolve_blob_paths(sql, &pack_trees, &root_tree_hashes)?;
-
-    // Second pass: store blobs with delta compression
-    for obj in &objects {
-        match obj.obj_type {
-            pack::ObjectType::Blob => {
-                let path = blob_paths
-                    .get(&obj.hash)
-                    .map(|s| s.as_str())
-                    .unwrap_or("unknown");
-                store::store_blob(sql, &obj.hash, &obj.data, path, KEYFRAME_INTERVAL)?;
-            }
-            pack::ObjectType::Tag => {
-                // Annotated tags: store as a commit-like object.
-                // For now, we skip storing tag objects and just handle
-                // lightweight tags via refs.
-            }
-            _ => {} // already handled
-        }
-    }
-
-    // --- 4. Update refs ---
+    // --- 8. Update refs ---
     let mut results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
 
     for cmd in &commands {
@@ -94,8 +54,7 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         results.push((cmd.ref_name.clone(), result));
     }
 
-    // --- 5. Set default branch + rebuild FTS index ---
-    // Auto-detect default branch: first branch pushed becomes the default.
+    // --- Set default branch + rebuild FTS index ---
     for (ref_name, result) in &results {
         if result.is_ok() && ref_name.starts_with("refs/heads/") {
             if store::get_config(sql, "default_branch")?.is_none() {
@@ -104,7 +63,6 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         }
     }
 
-    // Rebuild FTS if the default branch was updated
     if let Some(default_ref) = store::get_config(sql, "default_branch")? {
         for cmd in &commands {
             if cmd.ref_name == default_ref {
@@ -115,13 +73,128 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
         }
     }
 
-    // --- 6. Return report-status ---
+    // --- 9. Return report-status ---
     let status_body = build_report_status(&results);
 
     let mut resp = Response::from_bytes(status_body)?;
     resp.headers_mut()
         .set("Content-Type", "application/x-git-receive-pack-result")?;
     Ok(resp)
+}
+
+/// Process pack data using the streaming two-pass approach.
+///
+/// Pass 1: `build_index` walks the pack byte stream, recording metadata for
+/// each entry (offsets, type, delta base references). Zlib data is decompressed
+/// to a sink — no object data is held in memory.
+///
+/// Pass 2: entries are processed by type. Each is decompressed on-demand from
+/// the pack bytes (which stay in memory as the request body), delta chains are
+/// resolved iteratively, and the result is stored in permanent tables then
+/// dropped. Only one resolved object exists in memory at a time.
+fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8]) -> Result<()> {
+    // --- Build lightweight index ---
+    let (index, offset_to_idx) = pack::build_index(pack_data).map_err(|e| Error::RustError(e.0))?;
+
+    // --- Pre-compute types by following OFS_DELTA chains ---
+    // Returns Some(type) for entries resolvable via OFS_DELTA, None for REF_DELTA.
+    let types: Vec<Option<pack::ObjectType>> = (0..index.len())
+        .map(|i| pack::resolve_type(&index, &offset_to_idx, i))
+        .collect();
+
+    // hash_to_idx: populated incrementally for REF_DELTA support.
+    // For OFS_DELTA (the common case in push packs), this is unused.
+    let mut hash_to_idx: HashMap<String, usize> = HashMap::new();
+
+    // --- Process commits ---
+    let mut root_tree_hashes: Vec<String> = Vec::new();
+
+    for i in 0..index.len() {
+        if types[i] != Some(pack::ObjectType::Commit) {
+            continue;
+        }
+        let (_, data) = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx)
+            .map_err(|e| Error::RustError(e.0))?;
+        let hash = pack::hash_object(&pack::ObjectType::Commit, &data);
+        hash_to_idx.insert(hash.clone(), i);
+        let parsed = store::parse_commit(&data)
+            .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
+        root_tree_hashes.push(parsed.tree_hash.clone());
+        store::store_commit(sql, &hash, &parsed, &data)?;
+        // `data` is dropped here
+    }
+
+    // --- Process trees ---
+    for i in 0..index.len() {
+        if types[i] != Some(pack::ObjectType::Tree) {
+            continue;
+        }
+        let (_, data) = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx)
+            .map_err(|e| Error::RustError(e.0))?;
+        let hash = pack::hash_object(&pack::ObjectType::Tree, &data);
+        hash_to_idx.insert(hash.clone(), i);
+        store::store_tree(sql, &hash, &data)?;
+    }
+
+    // --- Resolve blob paths (all trees now in permanent storage) ---
+    let empty_pack_trees: HashMap<String, Vec<store::TreeEntry>> = HashMap::new();
+    let blob_paths = store::resolve_blob_paths(sql, &empty_pack_trees, &root_tree_hashes)?;
+
+    // --- Process blobs ---
+    for i in 0..index.len() {
+        if types[i] != Some(pack::ObjectType::Blob) {
+            continue;
+        }
+        let (_, data) = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx)
+            .map_err(|e| Error::RustError(e.0))?;
+        let hash = pack::hash_object(&pack::ObjectType::Blob, &data);
+        hash_to_idx.insert(hash.clone(), i);
+        let path = blob_paths
+            .get(&hash)
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        store::store_blob(sql, &hash, &data, path, KEYFRAME_INTERVAL)?;
+    }
+
+    // --- Handle REF_DELTA entries with unknown types ---
+    // These are rare in push packs (git prefers OFS_DELTA). Process any that
+    // remain after the main passes.
+    for i in 0..index.len() {
+        if types[i].is_some() {
+            continue; // already handled
+        }
+        let resolved = pack::resolve_entry(pack_data, &index, &offset_to_idx, i, &hash_to_idx);
+        match resolved {
+            Ok((obj_type, data)) => {
+                let hash = pack::hash_object(&obj_type, &data);
+                hash_to_idx.insert(hash.clone(), i);
+                match obj_type {
+                    pack::ObjectType::Commit => {
+                        let parsed = store::parse_commit(&data)
+                            .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
+                        store::store_commit(sql, &hash, &parsed, &data)?;
+                    }
+                    pack::ObjectType::Tree => {
+                        store::store_tree(sql, &hash, &data)?;
+                    }
+                    pack::ObjectType::Blob => {
+                        let path = blob_paths
+                            .get(&hash)
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        store::store_blob(sql, &hash, &data, path, KEYFRAME_INTERVAL)?;
+                    }
+                    pack::ObjectType::Tag => {} // skip
+                }
+            }
+            Err(_) => {
+                // Unresolvable entry (e.g. thin pack base not available).
+                // Skip silently — this is a known limitation.
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

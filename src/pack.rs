@@ -49,11 +49,26 @@ impl ObjectType {
     }
 }
 
+/// A fully resolved pack object with type and data.
+/// Used by `generate()` for fetch/clone and by `collect_objects()` in store.
 #[derive(Debug)]
 pub struct PackObject {
     pub obj_type: ObjectType,
-    pub hash: String,
     pub data: Vec<u8>,
+}
+
+/// Lightweight metadata for one entry in a pack file.
+/// Does NOT hold decompressed data — just offsets and delta references.
+pub struct PackEntryMeta {
+    /// Byte offset where the zlib-compressed data starts (after header +
+    /// any delta header bytes). Used for decompression.
+    pub data_offset: usize,
+    /// Raw type number: 1=commit, 2=tree, 3=blob, 4=tag, 6=ofs_delta, 7=ref_delta.
+    pub type_num: u8,
+    /// For OFS_DELTA (type 6): absolute byte offset of the base entry in the pack.
+    pub base_pack_offset: Option<usize>,
+    /// For REF_DELTA (type 7): hex SHA-1 hash of the base object.
+    pub base_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -68,15 +83,19 @@ impl std::fmt::Display for ParseError {
 type Result<T> = std::result::Result<T, ParseError>;
 
 // ---------------------------------------------------------------------------
-// Pack parsing
+// Streaming pack parser — index + on-demand resolution
 // ---------------------------------------------------------------------------
 
-/// Parse a git pack stream into fully resolved objects.
+/// Build a lightweight index of all entries in a pack file.
 ///
-/// Handles regular objects (commit, tree, blob, tag) and delta objects
-/// (OFS_DELTA, REF_DELTA) by resolving them against their base.
-pub fn parse(data: &[u8]) -> Result<Vec<PackObject>> {
-    // Header: "PACK" <version:4> <num_objects:4>
+/// Walks the pack byte stream, recording metadata (offsets, type, delta base
+/// references) for each entry. Zlib data is decompressed to a sink (discarded)
+/// only to determine entry boundaries — no object data is held in memory.
+///
+/// Returns `(index, offset_to_idx)` where `offset_to_idx` maps a pack byte
+/// offset to the entry's index in the Vec. This is needed for OFS_DELTA
+/// resolution.
+pub fn build_index(data: &[u8]) -> Result<(Vec<PackEntryMeta>, HashMap<usize, usize>)> {
     if data.len() < 12 {
         return Err(ParseError("pack too short for header".into()));
     }
@@ -90,161 +109,158 @@ pub fn parse(data: &[u8]) -> Result<Vec<PackObject>> {
     let num_objects = read_u32_be(data, 8) as usize;
     let mut pos = 12;
 
-    // First pass: parse all entries, collecting raw data and delta references.
-    // We need this because REF_DELTA can reference any object by hash, which
-    // might appear later in the pack.
-    let mut entries: Vec<RawEntry> = Vec::with_capacity(num_objects);
-    // Map from byte offset (within pack) to entry index, for OFS_DELTA
+    let mut index = Vec::with_capacity(num_objects);
     let mut offset_to_idx: HashMap<usize, usize> = HashMap::with_capacity(num_objects);
 
-    for i in 0..num_objects {
+    for _i in 0..num_objects {
         let entry_offset = pos;
         let (type_num, _size, header_len) = read_type_and_size(data, pos)?;
         pos += header_len;
 
-        let entry = match type_num {
-            // Regular object types
-            1 | 2 | 3 | 4 => {
-                let (decompressed, consumed) = zlib_decompress(data, pos)?;
-                pos += consumed;
-                RawEntry::Full {
-                    obj_type: ObjectType::from_type_num(type_num).unwrap(),
-                    data: decompressed,
-                }
-            }
-            // OFS_DELTA: negative offset to base object in this pack
+        let mut base_pack_offset = None;
+        let mut base_hash = None;
+
+        match type_num {
+            // Regular objects: nothing extra to read before zlib data
+            1 | 2 | 3 | 4 => {}
+            // OFS_DELTA: variable-length negative offset, then zlib data
             6 => {
                 let (offset, offset_len) = read_ofs_delta_offset(data, pos)?;
                 pos += offset_len;
-                let (decompressed, consumed) = zlib_decompress(data, pos)?;
-                pos += consumed;
-                let base_offset = entry_offset
-                    .checked_sub(offset)
-                    .ok_or_else(|| ParseError("OFS_DELTA offset underflow".into()))?;
-                RawEntry::OfsDelta {
-                    base_offset,
-                    delta_data: decompressed,
-                }
+                base_pack_offset = Some(
+                    entry_offset
+                        .checked_sub(offset)
+                        .ok_or_else(|| ParseError("OFS_DELTA offset underflow".into()))?,
+                );
             }
-            // REF_DELTA: 20-byte SHA-1 of the base object
+            // REF_DELTA: 20-byte SHA-1 hash, then zlib data
             7 => {
                 if pos + 20 > data.len() {
                     return Err(ParseError("REF_DELTA: truncated base hash".into()));
                 }
-                let base_hash = hex_encode(&data[pos..pos + 20]);
+                base_hash = Some(hex_encode(&data[pos..pos + 20]));
                 pos += 20;
-                let (decompressed, consumed) = zlib_decompress(data, pos)?;
-                pos += consumed;
-                RawEntry::RefDelta {
-                    base_hash,
-                    delta_data: decompressed,
-                }
+            }
+            _ => {
+                return Err(ParseError(format!("unknown object type {}", type_num)));
+            }
+        }
+
+        let data_offset = pos;
+
+        // Decompress to sink — we only need to know how many compressed bytes
+        // were consumed so we can advance `pos` to the next entry.
+        let consumed = zlib_skip(data, pos)?;
+        pos += consumed;
+
+        offset_to_idx.insert(entry_offset, index.len());
+        index.push(PackEntryMeta {
+            data_offset,
+            type_num,
+            base_pack_offset,
+            base_hash,
+        });
+    }
+
+    Ok((index, offset_to_idx))
+}
+
+/// Determine the final object type for a pack entry by following its
+/// OFS_DELTA chain back to a non-delta base.
+///
+/// Returns `None` for REF_DELTA entries (type resolution requires hash
+/// lookup, which isn't available from the index alone).
+pub fn resolve_type(
+    index: &[PackEntryMeta],
+    offset_to_idx: &HashMap<usize, usize>,
+    entry_idx: usize,
+) -> Option<ObjectType> {
+    let entry = &index[entry_idx];
+    match entry.type_num {
+        1..=4 => ObjectType::from_type_num(entry.type_num),
+        6 => {
+            let base_offset = entry.base_pack_offset?;
+            let &base_idx = offset_to_idx.get(&base_offset)?;
+            resolve_type(index, offset_to_idx, base_idx)
+        }
+        // REF_DELTA: can't follow without hash → index mapping
+        _ => None,
+    }
+}
+
+/// Resolve a single pack entry into its final (type, data) by decompressing
+/// from the pack bytes and applying any delta chain.
+///
+/// For OFS_DELTA chains, the base is found via `offset_to_idx`.
+/// For REF_DELTA, `hash_to_idx` is consulted (populated incrementally during
+/// processing). Only one resolved object is held in memory at a time (plus
+/// one delta instruction buffer during application).
+pub fn resolve_entry(
+    data: &[u8],
+    index: &[PackEntryMeta],
+    offset_to_idx: &HashMap<usize, usize>,
+    entry_idx: usize,
+    hash_to_idx: &HashMap<String, usize>,
+) -> Result<(ObjectType, Vec<u8>)> {
+    let entry = &index[entry_idx];
+
+    // Non-delta: just decompress
+    if let Some(obj_type) = ObjectType::from_type_num(entry.type_num) {
+        let (decompressed, _) = zlib_decompress(data, entry.data_offset)?;
+        return Ok((obj_type, decompressed));
+    }
+
+    // Delta: walk chain to non-delta base, collecting delta entry indices
+    let mut chain: Vec<usize> = Vec::new();
+    let mut current = entry_idx;
+
+    loop {
+        let e = &index[current];
+        match e.type_num {
+            1..=4 => break, // found non-delta base
+            6 => {
+                chain.push(current);
+                let base_offset = e
+                    .base_pack_offset
+                    .ok_or_else(|| ParseError("OFS_DELTA missing base_pack_offset".into()))?;
+                current = *offset_to_idx.get(&base_offset).ok_or_else(|| {
+                    ParseError(format!(
+                        "OFS_DELTA base offset {} not found in index",
+                        base_offset
+                    ))
+                })?;
+            }
+            7 => {
+                chain.push(current);
+                let base_hash = e
+                    .base_hash
+                    .as_ref()
+                    .ok_or_else(|| ParseError("REF_DELTA missing base_hash".into()))?;
+                current = *hash_to_idx
+                    .get(base_hash.as_str())
+                    .ok_or_else(|| ParseError(format!("REF_DELTA base {} not found", base_hash)))?;
             }
             _ => {
                 return Err(ParseError(format!(
-                    "unknown object type {} at entry {}",
-                    type_num, i
-                )))
+                    "invalid type {} in delta chain",
+                    e.type_num
+                )));
             }
-        };
-
-        offset_to_idx.insert(entry_offset, entries.len());
-        entries.push(entry);
-    }
-
-    // Second pass: resolve all deltas into full objects.
-    // We resolve iteratively until all entries are materialized.
-    let mut resolved: Vec<Option<(ObjectType, Vec<u8>)>> = vec![None; entries.len()];
-
-    // First, fill in all non-delta entries
-    for (i, entry) in entries.iter().enumerate() {
-        if let RawEntry::Full { obj_type, data } = entry {
-            resolved[i] = Some((*obj_type, data.clone()));
         }
     }
 
-    // Then resolve deltas. May need multiple passes if deltas chain on deltas.
-    let mut remaining = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| !matches!(e, RawEntry::Full { .. }))
-        .count();
+    // Decompress the non-delta base
+    let base_type = ObjectType::from_type_num(index[current].type_num)
+        .ok_or_else(|| ParseError(format!("invalid base type {}", index[current].type_num)))?;
+    let (mut result, _) = zlib_decompress(data, index[current].data_offset)?;
 
-    let max_iterations = remaining + 1; // prevent infinite loop
-    for _ in 0..max_iterations {
-        if remaining == 0 {
-            break;
-        }
-        let mut progress = false;
-
-        for i in 0..entries.len() {
-            if resolved[i].is_some() {
-                continue;
-            }
-            match &entries[i] {
-                RawEntry::OfsDelta {
-                    base_offset,
-                    delta_data,
-                } => {
-                    let base_idx = offset_to_idx.get(base_offset).copied();
-                    if let Some(idx) = base_idx {
-                        if let Some((base_type, base_data)) = &resolved[idx] {
-                            let result = apply_git_delta(base_data, delta_data)?;
-                            resolved[i] = Some((*base_type, result));
-                            remaining -= 1;
-                            progress = true;
-                        }
-                    }
-                }
-                RawEntry::RefDelta {
-                    base_hash,
-                    delta_data,
-                } => {
-                    // Find the base by hash in already-resolved objects
-                    let base = resolved.iter().find_map(|r| {
-                        r.as_ref().and_then(|(t, d)| {
-                            let h = hash_object(t, d);
-                            if h == *base_hash {
-                                Some((*t, d.clone()))
-                            } else {
-                                None
-                            }
-                        })
-                    });
-                    if let Some((base_type, base_data)) = base {
-                        let result = apply_git_delta(&base_data, delta_data)?;
-                        resolved[i] = Some((base_type, result));
-                        remaining -= 1;
-                        progress = true;
-                    }
-                }
-                RawEntry::Full { .. } => unreachable!(),
-            }
-        }
-
-        if !progress && remaining > 0 {
-            return Err(ParseError(format!(
-                "unable to resolve {} delta objects (missing base)",
-                remaining
-            )));
-        }
+    // Apply deltas from innermost (closest to base) to outermost (entry_idx)
+    for &delta_idx in chain.iter().rev() {
+        let (delta_data, _) = zlib_decompress(data, index[delta_idx].data_offset)?;
+        result = apply_git_delta(&result, &delta_data)?;
     }
 
-    // Build final output with hashes
-    let objects: Vec<PackObject> = resolved
-        .into_iter()
-        .map(|r| {
-            let (obj_type, data) = r.expect("unresolved object after delta resolution");
-            let hash = hash_object(&obj_type, &data);
-            PackObject {
-                obj_type,
-                hash,
-                data,
-            }
-        })
-        .collect();
-
-    Ok(objects)
+    Ok((base_type, result))
 }
 
 // ---------------------------------------------------------------------------
@@ -398,25 +414,6 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal: raw entry types for two-pass resolution
-// ---------------------------------------------------------------------------
-
-enum RawEntry {
-    Full {
-        obj_type: ObjectType,
-        data: Vec<u8>,
-    },
-    OfsDelta {
-        base_offset: usize,
-        delta_data: Vec<u8>,
-    },
-    RefDelta {
-        base_hash: String,
-        delta_data: Vec<u8>,
-    },
-}
-
-// ---------------------------------------------------------------------------
 // Internal: binary helpers
 // ---------------------------------------------------------------------------
 
@@ -504,6 +501,16 @@ fn read_varint_delta(data: &[u8], pos: usize) -> Result<(usize, usize)> {
     }
 
     Ok((value, i - pos))
+}
+
+/// Zlib decompress starting at `pos` in `data`, discarding the output.
+/// Returns the number of compressed bytes consumed from the input.
+/// Used during index building to skip over zlib data without allocating.
+fn zlib_skip(data: &[u8], pos: usize) -> Result<usize> {
+    let mut decoder = ZlibDecoder::new(&data[pos..]);
+    std::io::copy(&mut decoder, &mut std::io::sink())
+        .map_err(|e| ParseError(format!("zlib decompression failed: {}", e)))?;
+    Ok(decoder.total_in() as usize)
 }
 
 /// Zlib decompress starting at `pos` in `data`.

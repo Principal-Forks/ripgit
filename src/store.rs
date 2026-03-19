@@ -742,7 +742,6 @@ pub fn collect_objects(
 
         objects.push(pack::PackObject {
             obj_type: pack::ObjectType::Commit,
-            hash: commit_hash.clone(),
             data: raw_data,
         });
 
@@ -793,7 +792,6 @@ fn collect_tree_objects(
     if let Some(raw_data) = load_raw_object(sql, tree_hash)? {
         objects.push(pack::PackObject {
             obj_type: pack::ObjectType::Tree,
-            hash: tree_hash.to_string(),
             data: raw_data,
         });
     }
@@ -809,7 +807,6 @@ fn collect_tree_objects(
             if let Some(data) = blob_data {
                 objects.push(pack::PackObject {
                     obj_type: pack::ObjectType::Blob,
-                    hash: entry.hash.clone(),
                     data,
                 });
             }

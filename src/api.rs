@@ -441,7 +441,67 @@ pub fn handle_stats(sql: &SqlStorage) -> Result<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// GET /search?q=TODO&limit=50&scope=code&path=src/&ext=rs — search
+// Query parsing: @prefix: syntax
+// ---------------------------------------------------------------------------
+
+/// Parsed representation of a user search query after extracting `@prefix:` tokens.
+pub struct ParsedQuery {
+    /// The query to pass to FTS5 MATCH (with `@` stripped from column prefixes).
+    pub fts_query: String,
+    /// Extracted from `@path:value` — maps to a SQL `path LIKE 'value%'` filter.
+    pub path_filter: Option<String>,
+    /// Extracted from `@ext:value` — maps to a SQL `path LIKE '%.value'` filter.
+    pub ext_filter: Option<String>,
+    /// Implied scope when commits-only columns (`@author:`, `@message:`) are used.
+    pub scope: Option<&'static str>,
+}
+
+/// Parse `@prefix:value` tokens from a raw query string.
+///
+/// Supported prefixes:
+///   `@author:name`   → FTS5 `author:name`,  scope = commits
+///   `@message:text`  → FTS5 `message:text`, scope = commits
+///   `@content:text`  → FTS5 `content:text` (bypasses auto column wrapper)
+///   `@path:src/`     → SQL `path LIKE 'src/%'`
+///   `@ext:rs`        → SQL `path LIKE '%.rs'`
+pub fn parse_search_query(raw: &str) -> ParsedQuery {
+    let mut fts_tokens: Vec<String> = Vec::new();
+    let mut path_filter: Option<String> = None;
+    let mut ext_filter: Option<String> = None;
+    let mut commits_implied = false;
+
+    for token in raw.split_whitespace() {
+        if let Some(v) = token.strip_prefix("@path:") {
+            path_filter = Some(v.to_string());
+        } else if let Some(v) = token.strip_prefix("@ext:") {
+            ext_filter = Some(v.to_string());
+        } else if let Some(v) = token.strip_prefix("@author:") {
+            fts_tokens.push(format!("author:{}", v));
+            commits_implied = true;
+        } else if let Some(v) = token.strip_prefix("@message:") {
+            fts_tokens.push(format!("message:{}", v));
+            commits_implied = true;
+        } else if let Some(v) = token.strip_prefix("@content:") {
+            fts_tokens.push(format!("content:{}", v));
+        } else {
+            fts_tokens.push(token.to_string());
+        }
+    }
+
+    ParsedQuery {
+        fts_query: fts_tokens.join(" "),
+        path_filter,
+        ext_filter,
+        scope: if commits_implied {
+            Some("commits")
+        } else {
+            None
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /search?q=TODO&limit=50&scope=code — search
 // ---------------------------------------------------------------------------
 
 pub fn handle_search(sql: &SqlStorage, url: &Url) -> Result<Response> {
@@ -453,6 +513,10 @@ pub fn handle_search(sql: &SqlStorage, url: &Url) -> Result<Response> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
     let scope = get_query(url, "scope").unwrap_or_else(|| "code".to_string());
+
+    let parsed = parse_search_query(&query);
+    let query = parsed.fts_query;
+    let scope = parsed.scope.map(|s| s.to_string()).unwrap_or(scope);
 
     match scope.as_str() {
         "commits" => {
@@ -480,13 +544,11 @@ pub fn handle_search(sql: &SqlStorage, url: &Url) -> Result<Response> {
             }))
         }
         _ => {
-            let path_filter = get_query(url, "path");
-            let ext_filter = get_query(url, "ext");
             let results = crate::store::search_code(
                 sql,
                 &query,
-                path_filter.as_deref(),
-                ext_filter.as_deref(),
+                parsed.path_filter.as_deref(),
+                parsed.ext_filter.as_deref(),
                 limit,
             )?;
             #[derive(Serialize)]

@@ -64,6 +64,7 @@ setTimeout(function(){{
   var repo='{repo_name}';
   var branch='{default_branch}';
   function esc(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}}
+  function scopeOf(q){{return /@(author|message):/.test(q)?'commits':'code';}}
   inp.addEventListener('input',function(){{
     clearTimeout(timer);
     var q=inp.value.trim();
@@ -73,7 +74,7 @@ setTimeout(function(){{
   inp.addEventListener('keydown',function(e){{
     if(e.key==='Enter'){{
       var q=inp.value.trim();
-      if(q) window.location.href='/repo/'+repo+'/search-ui?q='+encodeURIComponent(q);
+      if(q) window.location.href='/repo/'+repo+'/search-ui?q='+encodeURIComponent(q)+'&scope='+scopeOf(q);
       e.preventDefault();
     }}else if(e.key==='Escape'){{
       box.hidden=true;inp.blur();
@@ -83,7 +84,7 @@ setTimeout(function(){{
     if(!inp.closest('.nav-search').contains(e.target)) box.hidden=true;
   }});
   function doSearch(q){{
-    fetch('/repo/'+repo+'/search?q='+encodeURIComponent(q)+'&scope=code&limit=10')
+    fetch('/repo/'+repo+'/search?q='+encodeURIComponent(q)+'&scope='+scopeOf(q)+'&limit=10')
       .then(function(r){{return r.json();}})
       .then(function(data){{
         if(inp.value.trim()!==q) return;
@@ -92,17 +93,29 @@ setTimeout(function(){{
           box.hidden=false;return;
         }}
         var html='';
-        data.results.forEach(function(r){{
-          var m=r.matches[0];
-          var snippet=m?m.text.replace(/^\s+/,''):'';
-          html+='<a class="nsr-item" href="/repo/'+repo+'/blob/'+esc(branch)+'/'+esc(r.path)+(m?'#L'+m.line:'')+'">'
-            +'<div class="nsr-path">'+esc(r.path)+'</div>'
-            +(snippet?'<div class="nsr-snippet">'+esc(snippet)+'</div>':'')
+        if(data.scope==='commits'){{
+          data.results.forEach(function(r){{
+            html+='<a class="nsr-item" href="/repo/'+repo+'/commit/'+esc(r.hash)+'">'
+              +'<div class="nsr-path">'+esc(r.hash.slice(0,7))+' \u2014 '+esc((r.message||'').split('\n')[0].slice(0,72))+'</div>'
+              +'<div class="nsr-snippet">'+esc(r.author)+'</div>'
+              +'</a>';
+          }});
+          html+='<a class="nsr-all" href="/repo/'+repo+'/search-ui?q='+encodeURIComponent(q)+'&scope=commits">'
+            +'View all \u2014 '+data.results.length+' commit'+(data.results.length===1?'':'s')
             +'</a>';
-        }});
-        html+='<a class="nsr-all" href="/repo/'+repo+'/search-ui?q='+encodeURIComponent(q)+'">'
-          +'View all \u2014 '+data.total_matches+' match'+(data.total_matches===1?'':'es')+' in '+data.total_files+' file'+(data.total_files===1?'':'s')
-          +'</a>';
+        }}else{{
+          data.results.forEach(function(r){{
+            var m=r.matches[0];
+            var snippet=m?m.text.replace(/^\s+/,''):'';
+            html+='<a class="nsr-item" href="/repo/'+repo+'/blob/'+esc(branch)+'/'+esc(r.path)+(m?'#L'+m.line:'')+'">'
+              +'<div class="nsr-path">'+esc(r.path)+'</div>'
+              +(snippet?'<div class="nsr-snippet">'+esc(snippet)+'</div>':'')
+              +'</a>';
+          }});
+          html+='<a class="nsr-all" href="/repo/'+repo+'/search-ui?q='+encodeURIComponent(q)+'&scope=code">'
+            +'View all \u2014 '+data.total_matches+' match'+(data.total_matches===1?'':'es')+' in '+data.total_files+' file'+(data.total_files===1?'':'s')
+            +'</a>';
+        }}
         box.innerHTML=html;box.hidden=false;
       }})
       .catch(function(){{}});
@@ -881,10 +894,13 @@ pub fn page_commit(sql: &SqlStorage, repo_name: &str, hash: &str) -> Result<Resp
 // ---------------------------------------------------------------------------
 
 pub fn page_search(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Response> {
-    let query = api::get_query(url, "q").unwrap_or_default();
-    let scope = api::get_query(url, "scope").unwrap_or_else(|| "code".to_string());
-    let path_filter = api::get_query(url, "path").unwrap_or_default();
-    let ext_filter = api::get_query(url, "ext").unwrap_or_default();
+    let raw_query = api::get_query(url, "q").unwrap_or_default();
+    let scope_param = api::get_query(url, "scope").unwrap_or_else(|| "code".to_string());
+
+    // Parse @prefix: tokens out of the query
+    let parsed = api::parse_search_query(&raw_query);
+    let query = parsed.fts_query.clone();
+    let scope = parsed.scope.map(|s| s.to_string()).unwrap_or(scope_param);
 
     // Resolve default branch for blob links
     let (default_branch, _) = resolve_default_branch(sql)?;
@@ -909,39 +925,28 @@ pub fn page_search(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Respo
   <a href="/repo/{repo}/search-ui?q={q}&scope=commits"{cc}>Commits</a>
 </div>"#,
         repo = repo_name,
-        q = html_escape(&query),
+        q = html_escape(&raw_query),
         ca = code_active,
         cc = commits_active,
     ));
 
-    // Search form
+    // Search form — single input, @prefix: syntax handles filtering
     html.push_str(&format!(
         r#"<form class="search-form" action="/repo/{repo}/search-ui" method="get">
   <input type="hidden" name="scope" value="{scope}">
-  <input type="text" name="q" value="{q}" placeholder="{placeholder}" style="flex:2">
-  {filters}
+  <input type="text" name="q" value="{q}" placeholder="Search... (@author: @message: @path: @ext: @content:)">
   <button type="submit">Search</button>
 </form>"#,
         repo = repo_name,
         scope = html_escape(&scope),
-        q = html_escape(&query),
-        placeholder = if scope == "commits" { "Search commit messages..." } else { "Search code... (symbols like fn foo() auto-use exact match)" },
-        filters = if scope == "code" {
-            format!(
-                r#"<input type="text" name="path" value="{}" placeholder="path filter (e.g. src/)" style="flex:1">
-  <input type="text" name="ext" value="{}" placeholder="ext (e.g. rs)" style="width:80px">"#,
-                html_escape(&path_filter),
-                html_escape(&ext_filter),
-            )
-        } else {
-            String::new()
-        },
+        q = html_escape(&raw_query),
     ));
 
-    if !query.is_empty() {
+    if !query.is_empty() || !raw_query.is_empty() {
+        let effective_query = if query.is_empty() { &raw_query } else { &query };
         if scope == "commits" {
             // Commit search
-            let results = store::search_commits(sql, &query, 50)?;
+            let results = store::search_commits(sql, effective_query, 50)?;
             if results.is_empty() {
                 html.push_str("<p>No matching commits found.</p>");
             } else {
@@ -971,17 +976,14 @@ pub fn page_search(sql: &SqlStorage, repo_name: &str, url: &Url) -> Result<Respo
             }
         } else {
             // Code search
-            let path_f = if path_filter.is_empty() {
-                None
-            } else {
-                Some(path_filter.as_str())
-            };
-            let ext_f = if ext_filter.is_empty() {
-                None
-            } else {
-                Some(ext_filter.as_str())
-            };
-            let results = store::search_code(sql, &query, path_f, ext_f, 50)?;
+            let effective_query = if query.is_empty() { &raw_query } else { &query };
+            let results = store::search_code(
+                sql,
+                effective_query,
+                parsed.path_filter.as_deref(),
+                parsed.ext_filter.as_deref(),
+                50,
+            )?;
             let total_matches: usize = results.iter().map(|r| r.matches.len()).sum();
 
             if results.is_empty() {

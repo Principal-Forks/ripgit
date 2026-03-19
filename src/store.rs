@@ -1376,10 +1376,16 @@ fn search_files_fts(
     ext_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(String, String)>> {
-    // Use {content} column filter so we don't match on filenames
+    // Use {content} column filter so we don't match on filenames,
+    // unless the user already specified a column (e.g. content:foo or path:bar).
+    let has_column_spec = query.contains("content:") || query.contains("path:");
+    let fts_match = if has_column_spec {
+        query.to_string()
+    } else {
+        format!("{{content}}: {}", query)
+    };
     let mut where_parts = vec!["fts_head MATCH ?".to_string()];
-    let mut params: Vec<SqlStorageValue> =
-        vec![SqlStorageValue::from(format!("{{content}}: {}", query))];
+    let mut params: Vec<SqlStorageValue> = vec![SqlStorageValue::from(fts_match)];
 
     if let Some(path) = path_filter {
         where_parts.push("path LIKE ?".to_string());

@@ -1,0 +1,466 @@
+# Git Internals & ripgit Implementation
+
+## 1. Git Data Structures
+
+### The Object Model
+
+Git has four object types. Every object is identified by the SHA-1 hash of its content (with a header prefix `"{type} {size}\0"`).
+
+**Blob** — raw file content. No metadata (no filename, no permissions). Just bytes. Two files with identical content share the same blob hash, regardless of where they live in the tree.
+
+**Tree** — a directory listing. Binary format:
+
+```
+<octal-mode> <name>\0<20-byte-raw-SHA-1>
+<octal-mode> <name>\0<20-byte-raw-SHA-1>
+...
+```
+
+Each entry points to either a blob (file) or another tree (subdirectory). The mode encodes type and permissions: `100644` (regular file), `100755` (executable), `040000` (directory), `120000` (symlink), `160000` (gitlink/submodule).
+
+Important: tree entries are sorted by name in a specific way — directories have a trailing `/` appended for sort comparison purposes, but the stored name doesn't include it. This sorting is part of the hash — changing the order changes the tree hash. This is why we store raw tree bytes in `raw_objects` instead of reconstructing from parsed entries.
+
+**Commit** — a snapshot pointer with metadata. Plain text format:
+
+```
+tree <40-hex-hash>\n
+parent <40-hex-hash>\n        (zero or more)
+author <name> <email> <unix-timestamp> <timezone>\n
+committer <name> <email> <unix-timestamp> <timezone>\n
+\n
+<message>
+```
+
+The tree hash points to the root tree of the snapshot. Parent hashes form the DAG (directed acyclic graph) — merge commits have multiple parents, root commits have zero.
+
+Key detail we discovered: old commits (git/git, Linux kernel) can contain non-UTF-8 bytes in author names (Latin-1, ISO-8859-1). The raw bytes are canonical — `String::from_utf8_lossy` handles display but the original bytes must be preserved for hash verification.
+
+**Tag** (annotated) — points to another object (usually a commit) with a message and optional GPG signature. We don't handle these yet (lightweight tags are just refs, not objects).
+
+### The Object Store
+
+Git's native storage has two layers:
+
+**Loose objects** — one file per object at `.git/objects/ab/cdef1234...`, zlib-compressed with the header. Simple but wasteful for repos with thousands of objects.
+
+**Pack files** — many objects in one file (`.git/objects/pack/pack-*.pack`). This is what git uses for network transfer and what we receive during `git push`.
+
+### Pack File Format
+
+```
+4 bytes:  "PACK" signature
+4 bytes:  version (2 or 3), big-endian
+4 bytes:  number of objects, big-endian
+[entries...]
+20 bytes: SHA-1 checksum of everything above
+```
+
+Each entry:
+
+```
+variable: type (3 bits) + size (variable-length encoding)
+variable: [delta header — only for delta types]
+variable: zlib-compressed data
+```
+
+The type field (3 bits):
+- 1 = commit
+- 2 = tree
+- 3 = blob
+- 4 = tag
+- 6 = OFS_DELTA (offset delta)
+- 7 = REF_DELTA (reference delta)
+
+The size is the **decompressed** size, encoded as a variable-length integer: first 4 bits in the type/size byte, then 7 bits per continuation byte (MSB = more bytes follow).
+
+### Delta Encoding
+
+Git packs use delta compression to avoid storing redundant data. Two delta types:
+
+**OFS_DELTA (type 6)** — the base object is at a negative byte offset within the same pack. The offset is encoded as a variable-length integer after the type/size header. This is the common case for objects within a single pack.
+
+**REF_DELTA (type 7)** — the base object is referenced by its 20-byte SHA-1 hash. The base may be in the same pack or (for thin packs) in the receiver's existing object store. The hash appears as 20 raw bytes after the type/size header.
+
+The delta payload itself (after zlib decompression) is a series of copy/insert instructions:
+
+```
+<base_size: varint>
+<result_size: varint>
+[instructions...]
+```
+
+Instructions:
+- **Copy** (MSB = 1): copy a range from the base object. 4 optional offset bytes + 3 optional length bytes, controlled by the low 7 bits of the instruction byte.
+- **Insert** (MSB = 0): the low 7 bits give the length, followed by that many literal bytes to insert.
+
+Delta chains can be deep — git's default `pack.depth` is 50. Object A might be a delta of B, which is a delta of C, which is a delta of D (a non-delta base). Resolution requires walking the chain to the base, decompressing each level, and applying deltas from innermost to outermost.
+
+### Thin Packs
+
+When `git push` sends a pack for an incremental push, it creates a **thin pack**: it uses REF_DELTA entries that reference objects the server already has (from previous pushes). This avoids re-sending unchanged trees and blobs.
+
+Example: if only one file changed in a deeply nested directory, git sends a delta of the root tree against the previous root tree (which the server has). The delta is tiny — just the one changed entry. Without thin packs, git would need to send the complete root tree.
+
+This was the source of our missing-trees bug: we resolved OFS_DELTAs (within the pack) correctly but failed to resolve REF_DELTAs whose bases were in the database. The fix: load external bases from `raw_objects` before processing.
+
+## 2. Git Wire Protocol (Smart HTTP)
+
+### Overview
+
+The smart HTTP protocol uses two endpoints per repository:
+
+- `GET /info/refs?service=git-receive-pack` — ref advertisement for push
+- `POST /git-receive-pack` — the actual push (commands + pack data)
+- `GET /info/refs?service=git-upload-pack` — ref advertisement for fetch/clone
+- `POST /git-upload-pack` — the actual fetch (want/have negotiation + pack response)
+
+### pkt-line Format
+
+All protocol communication uses pkt-lines:
+
+```
+<4-hex-length><payload>
+```
+
+The length includes the 4 hex digits themselves. Special values:
+- `0000` — flush packet (marks end of a section)
+- `0001` — delimiter packet (separates sections in v2)
+
+Examples:
+```
+003e# service=git-receive-pack\n     (62 bytes total, "003e" = 62)
+0000                                   (flush)
+00b1abc123... refs/heads/main\0report-status...  (ref + capabilities)
+003fabc123... refs/heads/feature\n
+0000                                   (flush)
+```
+
+### Push Protocol (git-receive-pack)
+
+**Phase 1: Ref Advertisement** (`GET /info/refs?service=git-receive-pack`)
+
+Server responds with:
+```
+001f# service=git-receive-pack
+0000
+<capabilities-line>    (first ref + NUL + capabilities)
+<additional-refs>
+0000
+```
+
+Capabilities we advertise: `report-status delete-refs ofs-delta`
+
+We also advertise `symref=HEAD:refs/heads/main` (or whatever the default branch is) so `git clone` knows which branch to check out.
+
+If the repository is empty (no refs), we send a special "zero-id capabilities" line:
+```
+0000000000000000000000000000000000000000 capabilities^{}\0report-status...
+```
+
+**Phase 2: Command + Pack** (`POST /git-receive-pack`)
+
+Client sends:
+```
+<old-hash> <new-hash> <ref-name>\n   (one per ref to update)
+0000
+PACK<version><count>[entries...]      (pack data)
+```
+
+The old hash is what the client believes the ref currently points to (for fast-forward validation). `0000...0000` means the ref is being created.
+
+**Two-phase push**: When the pack exceeds `http.postBuffer` (default 1 MiB), git sends a probe first — just the command lines + `0000` (empty pack). If the server returns 200, git sends the full payload in a second request. Our handler detects empty command sets and returns 200.
+
+**Phase 3: Report Status**
+
+Server responds with:
+```
+unpack ok\n
+ok refs/heads/main\n
+0000
+```
+
+Or on failure:
+```
+unpack ok\n
+ng refs/heads/main <reason>\n
+0000
+```
+
+Important: we removed `side-band-64k` from capabilities because our report-status doesn't wrap pkt-lines with sideband framing bytes. With sideband, each pkt-line would be prefixed with a channel byte (1 = pack data, 2 = progress, 3 = error).
+
+### Fetch Protocol (git-upload-pack)
+
+**Phase 1: Ref Advertisement** (same pattern as push)
+
+**Phase 2: Want/Have Negotiation** (`POST /git-upload-pack`)
+
+Client sends:
+```
+want <hash> <capabilities>\n     (objects it wants — usually ref tips)
+want <hash>\n                    (additional wants)
+0000
+have <hash>\n                    (objects it already has — for incremental fetch)
+have <hash>\n
+done\n                           (or flush for multi-ack)
+```
+
+For a clone (no local history), client sends only wants and `done`, no haves.
+
+Server determines the common ancestor set — objects reachable from "have" commits that are also ancestors of "want" commits. Then collects all objects reachable from wants but not from the common set.
+
+**Phase 3: Pack Response**
+
+Server sends:
+```
+NAK\n                            (or ACK for multi-ack)
+PACK<version><count>[entries...] (non-thin pack with all needed objects)
+```
+
+### Content Negotiation (Web UI)
+
+We also use HTTP `Accept` header negotiation: requests with `Accept: application/json` get JSON API responses; browsers (which send `Accept: text/html,...`) get server-rendered HTML pages. Same URL, different representation.
+
+## 3. Our Implementation
+
+### Architecture
+
+```
+HTTP Request
+  → Cloudflare Worker (entry point, routing)
+    → Durable Object stub.fetch() (one DO per repo name)
+      → Repository.fetch() handler
+        → Route to: git protocol / JSON API / Web UI / Admin
+          → SQLite (persistent storage within the DO)
+```
+
+Each repository is a single Durable Object with its own SQLite database (up to 10 GB). Strict isolation — no cross-repo interference. The DO is single-threaded: one request at a time, sequential execution.
+
+### Schema (`schema.rs`)
+
+11 tables + 3 FTS5 virtual tables + indexes:
+
+**`refs`** — branch and tag pointers
+```sql
+CREATE TABLE refs (name TEXT PRIMARY KEY, commit_hash TEXT NOT NULL)
+```
+
+**`commits`** — parsed commit metadata
+```sql
+CREATE TABLE commits (
+  hash TEXT PRIMARY KEY,
+  tree_hash TEXT NOT NULL,
+  author TEXT, author_email TEXT, author_date TEXT,
+  committer TEXT, committer_email TEXT, committer_date TEXT,
+  message TEXT
+)
+```
+
+**`commit_parents`** — parent edges (multiple rows per merge commit)
+```sql
+CREATE TABLE commit_parents (
+  commit_hash TEXT, ordinal INTEGER, parent_hash TEXT,
+  PRIMARY KEY (commit_hash, ordinal)
+)
+```
+
+**`commit_graph`** — binary lifting table for O(log N) ancestor queries
+```sql
+CREATE TABLE commit_graph (
+  commit_hash TEXT, level INTEGER, ancestor_hash TEXT,
+  PRIMARY KEY (commit_hash, level)
+)
+```
+
+**`trees`** — parsed tree entries (one row per entry, not per tree)
+```sql
+CREATE TABLE trees (
+  tree_hash TEXT, name TEXT, mode INTEGER, entry_hash TEXT
+)
+CREATE INDEX idx_trees_hash ON trees(tree_hash)
+```
+
+**`blob_groups`** — groups blobs by file path for delta compression
+```sql
+CREATE TABLE blob_groups (
+  group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path_hint TEXT, latest_version INTEGER
+)
+CREATE INDEX idx_blob_groups_path ON blob_groups(path_hint)
+```
+
+**`blobs`** — blob versions within groups
+```sql
+CREATE TABLE blobs (
+  blob_hash TEXT PRIMARY KEY,
+  group_id INTEGER, version_in_group INTEGER,
+  is_keyframe INTEGER,  -- 0=delta, 1=zlib keyframe, 2=raw keyframe
+  data BLOB, raw_size INTEGER, stored_size INTEGER
+)
+```
+
+**`blob_chunks`** — overflow for data exceeding the 2 MB row limit
+```sql
+CREATE TABLE blob_chunks (
+  group_id INTEGER, version_in_group INTEGER, chunk_index INTEGER,
+  data BLOB,
+  PRIMARY KEY (group_id, version_in_group, chunk_index)
+)
+```
+
+**`raw_objects`** — verbatim commit/tree bytes for hash-identical fetch
+```sql
+CREATE TABLE raw_objects (hash TEXT PRIMARY KEY, data BLOB)
+```
+
+**`config`** — key-value settings (default_branch, skip_fts, etc.)
+
+**FTS5 tables:**
+- `fts_head` — file content at HEAD for code search
+- `fts_commits` — commit messages + authors
+
+### Streaming Pack Parser (`pack.rs`)
+
+Two-pass design to keep memory usage constant regardless of pack size:
+
+**Pass 1: Index** (`build_index`) — walks the pack byte stream. For each entry, records metadata (`PackEntryMeta`: offset, type, size, delta base reference) but discards the decompressed data (decompresses to a sink via `zlib_skip`). Produces a `Vec<PackEntryMeta>` (~100 bytes per entry) and an `offset_to_idx` HashMap for OFS_DELTA resolution.
+
+**Pass 2: Process by type** — entries are resolved on demand from the pack bytes (still in memory as the request body). Processing order: commits → trees → blobs → REF_DELTA fallback.
+
+**Type resolution** (`resolve_type`) — follows OFS_DELTA chains to determine the final object type without decompressing. REF_DELTA entries return `None` (type unknown until resolved against external bases).
+
+**Entry resolution** (`resolve_entry`) — decompresses the entry and applies its delta chain:
+1. Walk the chain from entry to base (collecting intermediate indices)
+2. Resolve the base (from cache, external objects, or by decompression)
+3. Apply deltas from innermost to outermost
+
+**ResolveCache** — bounded HashMap (1024 entries max, 10 MB per-entry cap). Caches resolved objects to avoid re-decompressing shared delta chain bases. Critical for git's depth-50 delta chains where hundreds of objects share common bases.
+
+Key optimization: `try_cache` takes `&[u8]` and only calls `.to_vec()` when the entry is under the size cap. Zero-copy for large entries — an 87 MB blob passes through without any cloning.
+
+**Pre-allocated decompression** — `zlib_decompress` takes a `size_hint` (from the pack header) and creates `Vec::with_capacity(size)`. Without this, decompressing an 87 MB blob causes Vec to double repeatedly (64→128 MB), needing 192 MB peak during the reallocation copy. With pre-allocation: one 87 MB allocation, zero reallocs.
+
+**External objects** — for thin pack resolution, REF_DELTA bases not in the current pack are loaded from `raw_objects` in the database. Type detection queries the `commits` and `trees` tables by hash.
+
+### Delta Compression (`store.rs`)
+
+We use [xpatch](https://github.com/ImGajeed76/xpatch) for blob delta compression, completely separate from git's pack deltas. Blobs are grouped by file path (`blob_groups` table) — same file across commits shares a group.
+
+**Storage model:**
+- Every 50th version in a group is a **keyframe** (zlib-compressed full content)
+- Intermediate versions are **xpatch deltas** against the previous version
+- Reconstruction: find nearest keyframe, decompress, apply deltas forward
+
+**`is_keyframe` values:**
+- `0` — xpatch delta (forward delta against previous version)
+- `1` — zlib-compressed keyframe
+- `2` — raw keyframe (uncompressed, for blobs > 50 MB that would OOM during compression)
+
+**Chunking** — the 2 MB DO SQLite row limit means large data must be split. Both keyframes and deltas that exceed 1.9 MB are stored with an empty sentinel in `blobs.data` and actual bytes in `blob_chunks`. Reassembled transparently on read.
+
+**Reconstruction** (`reconstruct_blob`):
+1. Find nearest keyframe: `WHERE group_id = ? AND version_in_group <= ? AND is_keyframe >= 1 ORDER BY version_in_group DESC LIMIT 1`
+2. If `is_keyframe = 2`: reassemble chunks, return raw (no decompression)
+3. If `is_keyframe = 1`: reassemble chunks if empty sentinel, then zlib decompress
+4. Apply forward deltas (version N+1, N+2, ... up to target)
+
+**Compression ratios observed:**
+- 235-commit test repo: 5.3x
+- git/git (80K commits): 13.9x
+- hugo (9K commits): 1.6x
+- cloudflare/agents: ~5x
+
+### Commit Graph — Binary Lifting
+
+For O(log N) ancestor queries (used in upload-pack's want/have negotiation):
+
+```
+Level 0:  parent         (2^0 = 1 hop)
+Level 1:  grandparent    (2^1 = 2 hops)
+Level 2:  2^2 = 4 hops
+...
+Level k:  2^k hops
+```
+
+**Per-commit build**: 1 INSERT (level 0) + ~log₂(depth) × (1 SELECT + 1 INSERT). At 20K commits: ~15 levels per commit.
+
+**Bulk rebuild** (`admin/rebuild-graph`): ~15 `INSERT...SELECT` statements total, regardless of repo size. Deletes all rows, then builds level 0 from `commit_parents`, level 1 by joining level 0 with itself, etc. Stops when a level produces zero new rows.
+
+**Skipped in bulk mode** to reduce SQL operations during incremental push (saves ~5400 ops per 200-commit push at depth 6000).
+
+### SQL Optimizations
+
+**Batched INSERTs** — tree entries are batched 25 per statement (4 params each, under DO's 100 bound parameter limit). Commit parents batched 33 per statement. Cuts tree INSERT statements from 150K to 6K for a repo with 10K trees.
+
+**Existence checks** — `SELECT 1 FROM table WHERE key = ? LIMIT 1` instead of `SELECT COUNT(*)`. The query planner can stop at the first match.
+
+**`stored_size` column** — blob storage tracks `stored_size` at INSERT time. Stats endpoint uses `SUM(stored_size)` over an integer column instead of `SUM(LENGTH(data))` which would force a full table scan reading every blob's data page.
+
+**No request-level transactions** — each `sql.exec()` auto-commits. `BEGIN TRANSACTION`/`SAVEPOINT` are blocked by the DO runtime. `transactionSync()` exists in the JS runtime but isn't exposed in workers-rs 0.7.5. This means a DO timeout mid-push can leave partial state (objects stored but ref not updated). The `admin/set-ref` endpoint provides manual recovery.
+
+### Bulk Push Mode
+
+When `config.skip_fts = "1"`:
+- `store_commit` skips `build_commit_graph` and `fts_commits` INSERT
+- `handle_receive_pack` skips `rebuild_fts_index` (code search)
+- Saves ~5600 SQL operations per 200-commit push
+
+Post-push rebuild via admin endpoints:
+- `PUT /admin/rebuild-graph` — ~15 SQL calls
+- `PUT /admin/rebuild-fts-commits` — 1 `INSERT...SELECT`
+- `PUT /admin/rebuild-fts` — diffs HEAD tree and indexes all files
+
+### Search (`store.rs`)
+
+**Code search** — FTS5 virtual table `fts_head` indexes file content at HEAD. Rebuilt incrementally on each push using the diff engine to detect changed files (only re-indexes changed files, not the entire tree).
+
+**Symbol fallback** — FTS5 tokenizes on word boundaries, breaking symbol-heavy queries. Queries containing `.`, `_`, `()`, `::` automatically fall back to exact substring matching via `INSTR(content, ?)`.
+
+**Commit search** — separate `fts_commits` FTS5 table indexes commit messages and authors.
+
+**Scope filters** — path prefix (`path=src/`) and file extension (`ext=rs`) narrow search results.
+
+### Diff Engine (`diff.rs`)
+
+**Recursive tree comparison** — walks two trees in parallel, comparing entry hashes. Short-circuits on matching subtree hashes (if a directory's tree hash is the same, skip it entirely).
+
+**Line-level diffs** — uses the `similar` crate (pure Rust, compiles to WASM) for unified diff generation with context lines and hunk headers.
+
+### Web UI (`web.rs`)
+
+6 server-rendered HTML pages: home (tree + README + recent commits), tree browser, blob viewer (syntax highlighting + line anchors), commit log (paginated), commit detail (colored diffs), search (code + commits tabs). Branch selector on all pages.
+
+### Memory Budget (128 MB DO limit)
+
+The tightest constraint. Our memory map during push processing:
+
+```
+Pack body (request):     variable (kept for entire request)
+Pack index:              ~100 bytes × object count
+ResolveCache:            up to 1024 entries × 10 MB cap each
+External objects:        ~KB per thin pack base
+Current resolved object: one at a time (dropped after storage)
+store_blob working mem:  reconstruct_blob + xpatch delta
+zlib buffers:            pre-allocated via size hint
+```
+
+Key discoveries and fixes:
+- `Vec::with_capacity(size_hint)` for zlib decompression — eliminates Vec doubling (64→128 MB peak → exactly size MB)
+- `try_cache` with 10 MB per-entry cap — large blobs pass through zero-copy
+- `cache.clear()` before blob processing — frees commit/tree cache entries
+- `is_keyframe = 2` for blobs > 50 MB — stores raw + chunked, skips zlib compression buffer
+- Auto-split in push script — estimates pack size, recursively halves step if > 30 MB
+
+### Known Platform Constraints
+
+| Constraint | Limit | Impact |
+|---|---|---|
+| DO memory | 128 MB | Pack body + working memory must fit. Single commits with >60 MB packs can OOM. |
+| SQLite row size | 2 MB | Large blobs/deltas chunked across `blob_chunks` |
+| Request body | 100 MB | Hard Workers limit. Packs must be smaller. |
+| Storage op timeout | ~30 s | Cumulative `sql.exec()` time. Limits objects per push. |
+| CPU time | 300 s (configured) | Generous, rarely the bottleneck. |
+| SQLite DB size | 10 GB | Plenty for most repos. git/git at 80K commits = 4.3 GB. |
+| No transactions | Per-statement auto-commit | Partial state on timeout. Manual recovery via admin endpoints. |
+
+---
+

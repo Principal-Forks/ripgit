@@ -4,8 +4,7 @@
 #
 # Clones a repo (if needed), configures the ripgit remote, deletes the remote
 # repo to start clean, enables bulk mode, pushes incrementally, rebuilds
-# indexes, and verifies. Streams worker logs via `wrangler tail` in the
-# background so you can see server-side errors in real time.
+# indexes, and verifies.
 #
 # Usage:
 #   ./scripts/push-test.sh [options]
@@ -13,11 +12,12 @@
 # Options:
 #   -r, --repo PATH        Local repo path (default: ../openclaw)
 #   -n, --name NAME        Repo name on ripgit (default: basename of repo path)
+#   -u, --owner NAME       Owner name on ripgit (default: test)
+#   -t, --token TOKEN      Access token (from /settings). Embeds in git URL, sent as Bearer for curl.
 #   -o, --origin URL       Git clone URL (used if local repo doesn't exist)
 #   -s, --step SIZE        First-parent commits per push (default: 200)
 #   -w, --worker URL       Worker base URL (default: https://ripgit.stevej.workers.dev)
 #   -b, --branch BRANCH    Branch to push (default: main)
-#   --no-tail              Don't start wrangler tail
 #   --no-delete            Don't delete the remote repo first (resume mode)
 #   --no-rebuild           Skip post-push index rebuilds
 #   --skip-to N            Skip first N checkpoints (resume from checkpoint N+1)
@@ -36,14 +36,15 @@
 set -euo pipefail
 
 # --- Defaults ---
-REPO_PATH="../openclaw"
+REPO_PATH="../curl"
 REPO_NAME=""
+OWNER="test"
+TOKEN=""
 ORIGIN_URL=""
 STEP=200
-WORKER_URL="https://ripgit.stevej.workers.dev"
+WORKER_URL="https://git.theagents.company"
 BRANCH="main"
-DO_TAIL=true
-DO_DELETE=true
+DO_DELETE=false
 DO_REBUILD=true
 SKIP_TO=0
 
@@ -52,11 +53,13 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -r|--repo)     REPO_PATH="$2"; shift 2 ;;
     -n|--name)     REPO_NAME="$2"; shift 2 ;;
+    -u|--owner)    OWNER="$2"; shift 2 ;;
+    -t|--token)    TOKEN="$2"; shift 2 ;;
     -o|--origin)   ORIGIN_URL="$2"; shift 2 ;;
     -s|--step)     STEP="$2"; shift 2 ;;
     -w|--worker)   WORKER_URL="$2"; shift 2 ;;
     -b|--branch)   BRANCH="$2"; shift 2 ;;
-    --no-tail)     DO_TAIL=false; shift ;;
+    --no-tail)     shift ;;  # no-op, kept for backwards compat
     --no-delete)   DO_DELETE=false; shift ;;
     --no-rebuild)  DO_REBUILD=false; shift ;;
     --skip-to)     SKIP_TO="$2"; shift 2 ;;
@@ -76,8 +79,21 @@ if [[ -z "$REPO_NAME" ]]; then
   REPO_NAME="$(basename "$REPO_PATH")"
 fi
 
-BASE_URL="${WORKER_URL}/repo/${REPO_NAME}"
+BASE_URL="${WORKER_URL}/${OWNER}/${REPO_NAME}"
 REMOTE_NAME="ripgit"
+
+# Git needs credentials embedded in the URL.
+# curl uses a Bearer header so the token isn't logged in process lists.
+if [[ -n "$TOKEN" ]]; then
+  SCHEME="${WORKER_URL%%://*}"
+  HOST="${WORKER_URL#*://}"
+  GIT_URL="${SCHEME}://${OWNER}:${TOKEN}@${HOST}/${OWNER}/${REPO_NAME}"
+  CURL_OPTS=(-H "Authorization: Bearer ${TOKEN}")
+else
+  GIT_URL="${BASE_URL}"
+  CURL_OPTS=()
+  warn "No --token provided. Push will fail if auth is required."
+fi
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -102,17 +118,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 1. Start wrangler tail ---
-if $DO_TAIL; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  RIPGIT_DIR="$(dirname "$SCRIPT_DIR")"
-  log "Starting wrangler tail (logs in background)..."
-  (cd "$RIPGIT_DIR" && bun x wrangler tail --format pretty 2>&1 | sed "s/^/${YELLOW}[tail]${NC} /" &)
-  TAIL_PID=$!
-  sleep 2
-fi
-
-# --- 2. Ensure local repo exists ---
+# --- 1. Ensure local repo exists ---
 if [[ ! -d "$REPO_PATH/.git" ]]; then
   if [[ -z "$ORIGIN_URL" ]]; then
     fail "Local repo not found at $REPO_PATH and no --origin URL provided"
@@ -128,15 +134,14 @@ cd "$REPO_PATH"
 
 if git remote get-url "$REMOTE_NAME" &>/dev/null; then
   CURRENT_URL=$(git remote get-url "$REMOTE_NAME")
-  EXPECTED_URL="${BASE_URL}"
-  if [[ "$CURRENT_URL" != "$EXPECTED_URL" ]]; then
-    git remote set-url "$REMOTE_NAME" "$EXPECTED_URL"
-    warn "Updated remote $REMOTE_NAME: $CURRENT_URL -> $EXPECTED_URL"
+  if [[ "$CURRENT_URL" != "$GIT_URL" ]]; then
+    git remote set-url "$REMOTE_NAME" "$GIT_URL"
+    warn "Updated remote $REMOTE_NAME URL"
   fi
 else
-  git remote add "$REMOTE_NAME" "${BASE_URL}"
+  git remote add "$REMOTE_NAME" "$GIT_URL"
 fi
-ok "Remote: $REMOTE_NAME -> $(git remote get-url "$REMOTE_NAME")"
+ok "Remote: $REMOTE_NAME -> ${BASE_URL}"  # log without token
 
 # --- 4. Gather commit info ---
 TOTAL_FP=$(git rev-list --first-parent --count "$BRANCH")
@@ -153,7 +158,7 @@ log "Generated $NUM_CHECKPOINTS checkpoints (every ${STEP} fp commits)"
 # --- 5. Delete remote repo ---
 if $DO_DELETE; then
   log "Deleting remote repo $REPO_NAME ..."
-  RESULT=$(curl -s -X DELETE "${BASE_URL}/")
+  RESULT=$(curl -s "${CURL_OPTS[@]}" -X DELETE "${BASE_URL}/")
   if [[ "$RESULT" == "deleted" ]]; then
     ok "Remote repo deleted"
   else
@@ -163,7 +168,7 @@ fi
 
 # --- 6. Enable bulk mode ---
 log "Setting skip_fts=1 (bulk mode) ..."
-curl -s -X PUT "${BASE_URL}/admin/config?key=skip_fts&value=1" > /dev/null
+curl -s "${CURL_OPTS[@]}" -X PUT "${BASE_URL}/admin/config?key=skip_fts&value=1" > /dev/null
 ok "Bulk mode enabled"
 
 # Reset remote tracking
@@ -279,7 +284,7 @@ while IFS= read -r sha; do
 
   if ! push_range "$sha" "$PREV_FP" "$FP_NUM"; then
     PUSH_FAIL=$((PUSH_FAIL+1))
-    REF_STATE=$(curl -s "${BASE_URL}/refs" 2>/dev/null || echo "unreachable")
+    REF_STATE=$(curl -s "${CURL_OPTS[@]}" "${BASE_URL}/refs" 2>/dev/null || echo "unreachable")
     fail "Push $i failed. Server refs: $REF_STATE"
     fail "Stopping. To resume: $0 --no-delete --skip-to $((i-1)) -r $REPO_PATH -s $STEP"
     break
@@ -308,26 +313,26 @@ fi
 if [[ $PUSH_FAIL -eq 0 ]] && $DO_REBUILD; then
   echo ""
   log "Disabling bulk mode ..."
-  curl -s -X PUT "${BASE_URL}/admin/config?key=skip_fts&value=0" > /dev/null
+  curl -s "${CURL_OPTS[@]}" -X PUT "${BASE_URL}/admin/config?key=skip_fts&value=0" > /dev/null
   ok "Bulk mode disabled"
 
   log "Rebuilding commit graph ..."
-  RESULT=$(curl -s -X PUT "${BASE_URL}/admin/rebuild-graph")
+  RESULT=$(curl -s "${CURL_OPTS[@]}" -X PUT "${BASE_URL}/admin/rebuild-graph")
   ok "$RESULT"
 
   log "Rebuilding fts_commits ..."
-  RESULT=$(curl -s -X PUT "${BASE_URL}/admin/rebuild-fts-commits")
+  RESULT=$(curl -s "${CURL_OPTS[@]}" -X PUT "${BASE_URL}/admin/rebuild-fts-commits")
   ok "$RESULT"
 
   log "Rebuilding fts_head (code search) ..."
-  RESULT=$(curl -s -X PUT "${BASE_URL}/admin/rebuild-fts")
+  RESULT=$(curl -s "${CURL_OPTS[@]}" -X PUT "${BASE_URL}/admin/rebuild-fts")
   ok "$RESULT"
 fi
 
 # --- 10. Stats ---
 echo ""
 ELAPSED=$(( $(date +%s) - START_TIME ))
-STATS=$(curl -s "${BASE_URL}/stats")
+STATS=$(curl -s "${CURL_OPTS[@]}" "${BASE_URL}/stats")
 COMMITS=$(echo "$STATS" | grep -o '"commits":[0-9]*' | cut -d: -f2)
 BLOBS=$(echo "$STATS" | grep -o '"blobs":[0-9]*' | cut -d: -f2)
 RATIO=$(echo "$STATS" | grep -o '"compression_ratio":[0-9.]*' | cut -d: -f2)

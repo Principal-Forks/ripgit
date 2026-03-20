@@ -13,6 +13,39 @@ use worker::*;
 pub const KEYFRAME_INTERVAL: i64 = 50;
 
 // ---------------------------------------------------------------------------
+// Identity from trusted X-Ripgit-Actor-* headers.
+// These are only set by the auth worker (via service binding) and must never
+// be forwarded from the public internet.
+// ---------------------------------------------------------------------------
+
+struct Actor {
+    display_name: String,
+}
+
+fn actor_from_request(req: &Request) -> Option<Actor> {
+    let name = req.headers().get("X-Ripgit-Actor-Name").ok()??;
+    Some(Actor { display_name: name })
+}
+
+/// Returns a deny Response if the actor cannot write to this repo, else None.
+/// Ownership is checked by comparing the actor's display_name to the URL owner.
+fn check_write_access(actor: &Option<Actor>, repo_owner: &str) -> Option<Result<Response>> {
+    match actor {
+        None => Some(unauthorized_401()),
+        Some(a) if a.display_name == repo_owner => None,
+        Some(_) => Some(Response::error("Forbidden: you don't own this repository", 403)),
+    }
+}
+
+/// 401 with WWW-Authenticate so git knows to prompt for / retry with credentials.
+fn unauthorized_401() -> Result<Response> {
+    let mut resp = Response::error("Unauthorized: sign in to push", 401)?;
+    resp.headers_mut()
+        .set("WWW-Authenticate", r#"Basic realm="ripgit""#)?;
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
 // Worker entry point — route to the named Repository DO
 // ---------------------------------------------------------------------------
 
@@ -22,13 +55,24 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = url.path();
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    // All paths under /repo/:name are handled by a DO instance named after
-    // the repository. This includes both git smart HTTP endpoints and the
-    // read API.
-    if parts.len() >= 2 && parts[0] == "repo" {
-        let repo_name = parts[1];
+    // /:owner/ — user profile page (parts = ["owner", ""] with trailing slash,
+    // or parts = ["owner"] without). Handled at the Worker level since there
+    // is no per-owner DO; it just shows push instructions.
+    let is_owner_page = (parts.len() == 1 && !parts[0].is_empty())
+        || (parts.len() == 2 && !parts[0].is_empty() && parts[1].is_empty());
+    if is_owner_page {
+        let owner = parts[0];
+        let actor_name = actor_from_request(&req).map(|a| a.display_name);
+        let url = req.url()?;
+        let repos = list_repos(&env, owner).await;
+        return web::page_owner_profile(owner, actor_name.as_deref(), &url, &repos);
+    }
+
+    // /:owner/:repo/* — dispatched to a DO instance named "{owner}/{repo}".
+    if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        let do_name = format!("{}/{}", parts[0], parts[1]);
         let namespace = env.durable_object("REPOSITORY")?;
-        let id = namespace.id_from_name(repo_name)?;
+        let id = namespace.id_from_name(&do_name)?;
         let stub = id.get_stub()?;
         return stub.fetch_with_request(req).await;
     }
@@ -65,13 +109,19 @@ impl DurableObject for Repository {
         let path = url.path();
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-        // Minimum: ["repo", ":name"]
+        // Minimum: [":owner", ":repo"]
         if parts.len() < 2 {
             return Response::error("Not Found", 404);
         }
 
+        let owner = parts[0];
         let repo_name = parts[1];
         let action = if parts.len() >= 3 { parts[2] } else { "" };
+
+        // Resolve the caller's identity from trusted headers (set by auth worker).
+        // None means anonymous — allowed for reads, denied for writes.
+        let actor = actor_from_request(&req);
+        let actor_name = actor.as_ref().map(|a| a.display_name.as_str());
 
         // Does the client want HTML? (browsers send Accept: text/html)
         let wants_html = req
@@ -91,22 +141,44 @@ impl DurableObject for Repository {
                     .map(|(_, v)| v.to_string())
                     .unwrap_or_default();
                 match service.as_str() {
-                    "git-receive-pack" => self.advertise_refs("git-receive-pack"),
+                    "git-receive-pack" => {
+                        if let Some(resp) = check_write_access(&actor, owner) {
+                            return resp;
+                        }
+                        self.advertise_refs("git-receive-pack")
+                    }
                     "git-upload-pack" => self.advertise_refs("git-upload-pack"),
                     _ => Response::error("Unsupported service", 403),
                 }
             }
             (Method::Post, "git-receive-pack") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
                 let body = req.bytes().await?;
-                git::handle_receive_pack(&self.sql, &body)
+                let resp = git::handle_receive_pack(&self.sql, &body)?;
+                // On successful push, register the repo in the REGISTRY KV so
+                // the owner profile page can list it. Best-effort: never fail the push.
+                if resp.status_code() == 200 {
+                    let key = format!("repo:{}/{}", owner, repo_name);
+                    if let Ok(kv) = self.env.kv("REGISTRY") {
+                        if let Ok(builder) = kv.put(&key, "1") {
+                            let _ = builder.execute().await;
+                        }
+                    }
+                }
+                Ok(resp)
             }
             (Method::Post, "git-upload-pack") => {
                 let body = req.bytes().await?;
                 git::handle_upload_pack(&self.sql, &body)
             }
 
-            // -- Delete all data (for testing) --
+            // -- Delete all data (owner only) --
             (Method::Delete, "") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
                 self.state.storage().delete_all().await?;
                 Response::ok("deleted")
             }
@@ -142,11 +214,11 @@ impl DurableObject for Repository {
             }
 
             // -- Web UI --
-            (Method::Get, "") => web::page_home(&self.sql, repo_name, &url),
-            (Method::Get, "log") => web::page_log(&self.sql, repo_name, &url),
+            (Method::Get, "") => web::page_home(&self.sql, owner, repo_name, &url, actor_name),
+            (Method::Get, "commits") => web::page_log(&self.sql, owner, repo_name, &url, actor_name),
             (Method::Get, "commit") | (Method::Get, "diff") => {
                 let hash = parts.get(3).unwrap_or(&"");
-                web::page_commit(&self.sql, repo_name, hash)
+                web::page_commit(&self.sql, owner, repo_name, hash, actor_name)
             }
             (Method::Get, "tree") => {
                 let ref_name = parts.get(3).unwrap_or(&"main");
@@ -155,7 +227,7 @@ impl DurableObject for Repository {
                 } else {
                     String::new()
                 };
-                web::page_tree(&self.sql, repo_name, ref_name, &sub_path)
+                web::page_tree(&self.sql, owner, repo_name, ref_name, &sub_path, actor_name)
             }
             (Method::Get, "blob") => {
                 let ref_name = parts.get(3).unwrap_or(&"main");
@@ -164,12 +236,37 @@ impl DurableObject for Repository {
                 } else {
                     String::new()
                 };
-                web::page_blob(&self.sql, repo_name, ref_name, &sub_path)
+                web::page_blob(&self.sql, owner, repo_name, ref_name, &sub_path, actor_name)
             }
-            (Method::Get, "search-ui") => web::page_search(&self.sql, repo_name, &url),
+            (Method::Get, "search-ui") => web::page_search(&self.sql, owner, repo_name, &url, actor_name),
+            (Method::Get, "settings") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                web::page_settings(&self.sql, owner, repo_name, actor_name)
+            }
+            (Method::Post, "settings") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
+                let sub = parts.get(3).copied().unwrap_or("");
+                self.handle_settings_action(owner, repo_name, sub, req).await
+            }
+            (Method::Get, "raw") => {
+                let ref_name = parts.get(3).unwrap_or(&"main");
+                let sub_path = if parts.len() > 4 {
+                    parts[4..].join("/")
+                } else {
+                    String::new()
+                };
+                web::serve_raw(&self.sql, ref_name, &sub_path)
+            }
 
-            // -- Admin endpoints --
+            // -- Admin endpoints (owner only) --
             (Method::Put, "admin") => {
+                if let Some(resp) = check_write_access(&actor, owner) {
+                    return resp;
+                }
                 let sub = parts.get(3).unwrap_or(&"");
                 match *sub {
                     "set-ref" => {
@@ -288,6 +385,135 @@ impl DurableObject for Repository {
 // ---------------------------------------------------------------------------
 
 impl Repository {
+    /// Handle POST /:owner/:repo/settings/:action — all owner-only mutations.
+    async fn handle_settings_action(
+        &self,
+        owner: &str,
+        repo_name: &str,
+        action: &str,
+        mut req: Request,
+    ) -> Result<Response> {
+        let settings_url = format!("/{}/{}/settings", owner, repo_name);
+
+        // Helper: redirect back to settings (relative URL via Location header)
+        let back = || -> Result<Response> {
+            let mut r = Response::error("", 302)?;
+            r.headers_mut().set("Location", &settings_url)?;
+            Ok(r)
+        };
+
+        match action {
+            "rebuild-graph" => {
+                self.sql.exec("DELETE FROM commit_graph", None)?;
+                self.sql.exec(
+                    "INSERT INTO commit_graph (commit_hash, level, ancestor_hash)
+                     SELECT cp.commit_hash, 0, cp.parent_hash
+                     FROM commit_parents cp WHERE cp.ordinal = 0",
+                    None,
+                )?;
+                let mut level: i64 = 1;
+                loop {
+                    let prev = level - 1;
+                    let result = self.sql.exec(
+                        &format!(
+                            "INSERT INTO commit_graph (commit_hash, level, ancestor_hash)
+                             SELECT cg.commit_hash, {level}, cg2.ancestor_hash
+                             FROM commit_graph cg
+                             JOIN commit_graph cg2
+                               ON cg2.commit_hash = cg.ancestor_hash AND cg2.level = {prev}
+                             WHERE cg.level = {prev}",
+                            level = level,
+                            prev = prev,
+                        ),
+                        None,
+                    )?;
+                    if result.rows_written() == 0 { break; }
+                    level += 1;
+                }
+                back()
+            }
+
+            "rebuild-fts-commits" => {
+                self.sql.exec("DELETE FROM fts_commits", None)?;
+                self.sql.exec(
+                    "INSERT INTO fts_commits (hash, message, author)
+                     SELECT hash, message, author FROM commits",
+                    None,
+                )?;
+                back()
+            }
+
+            "rebuild-fts" => {
+                let default_ref = store::get_config(&self.sql, "default_branch")?
+                    .unwrap_or_else(|| "refs/heads/main".to_string());
+                #[derive(serde::Deserialize)]
+                struct RefRow { commit_hash: String }
+                let rows: Vec<RefRow> = self.sql.exec(
+                    "SELECT commit_hash FROM refs WHERE name = ?",
+                    vec![SqlStorageValue::from(default_ref)],
+                )?.to_array()?;
+                if let Some(row) = rows.first() {
+                    store::rebuild_fts_index(&self.sql, &row.commit_hash)?;
+                }
+                back()
+            }
+
+            "default-branch" => {
+                let body = req.text().await?;
+                let branch = body
+                    .split('&')
+                    .find_map(|pair| {
+                        let mut kv = pair.splitn(2, '=');
+                        if kv.next() == Some("branch") {
+                            kv.next().map(|v| v.replace('+', " "))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                let branch = branch.trim();
+                if !branch.is_empty() {
+                    store::set_config(&self.sql, "default_branch", branch)?;
+                }
+                back()
+            }
+
+            "delete" => {
+                let body = req.text().await?;
+                let confirm_val = body
+                    .split('&')
+                    .find_map(|pair| {
+                        let mut kv = pair.splitn(2, '=');
+                        if kv.next() == Some("confirm") {
+                            kv.next().map(|v| {
+                                // minimal URL decode for / (%2F) and spaces
+                                v.replace('+', " ")
+                                 .replace("%2F", "/")
+                                 .replace("%2f", "/")
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let expected = format!("{}/{}", owner, repo_name);
+                if confirm_val.trim() == expected {
+                    self.state.storage().delete_all().await?;
+                    // Redirect to owner profile after deletion
+                    let mut r = Response::error("", 302)?;
+                    r.headers_mut().set("Location", &format!("/{}/", owner))?;
+                    Ok(r)
+                } else {
+                    // Wrong confirmation — bounce back to settings
+                    back()
+                }
+            }
+
+            _ => Response::error("Not Found", 404),
+        }
+    }
+
     /// Ref advertisement for both receive-pack and upload-pack.
     /// Returns current refs in pkt-line format so git knows what we have.
     fn advertise_refs(&self, service: &str) -> Result<Response> {
@@ -380,4 +606,23 @@ fn pkt_line(buf: &mut Vec<u8>, data: &str) {
 /// Used to distinguish API calls (by hash) from web UI calls (by ref + path).
 fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// List repos registered in the REGISTRY KV for the given owner.
+/// Keys are stored as "repo:{owner}/{repo}".
+/// Returns an empty list if the KV binding is unavailable or the list fails.
+async fn list_repos(env: &Env, owner: &str) -> Vec<String> {
+    let prefix = format!("repo:{}/", owner);
+    let kv = match env.kv("REGISTRY") {
+        Ok(kv) => kv,
+        Err(_) => return vec![],
+    };
+    match kv.list().prefix(prefix.clone()).execute().await {
+        Ok(result) => result
+            .keys
+            .into_iter()
+            .map(|k| k.name[prefix.len()..].to_string())
+            .collect(),
+        Err(_) => vec![],
+    }
 }

@@ -23,23 +23,25 @@ src/
                 fts_head, fts_commits)
   pack.rs     — Streaming pack parser: build_index (decompress-to-sink),
                 resolve_type (OFS_DELTA chain following), resolve_entry
-                (on-demand decompression with bounded ResolveCache),
-                pack generator for fetch
+                (on-demand decompression, Arc-based ResolveCache with byte
+                budget, ResolveCtx bundle), pack generator for fetch.
+                MAX_PACK_BYTES (50 MB) and CACHE_BUDGET_BYTES (20 MB) constants.
   store.rs    — Storage layer: commit/tree/blob parsing, xpatch delta
                 compression with zlib-compressed keyframes + blob_chunks
                 overflow, batched SQL INSERTs, binary lifting commit graph,
                 tree walking, blob reconstruction, config helpers,
                 incremental FTS rebuild, search (FTS5 + INSTR), lossy UTF-8
-  git.rs      — Git smart HTTP protocol: receive-pack (streaming pack
-                processing, two-phase push handling, dynamic default branch,
-                FTS trigger), upload-pack (fetch)
+  git.rs      — Git smart HTTP protocol: receive-pack (pack body size gate,
+                streaming pack processing, two-phase push handling, dynamic
+                default branch, FTS trigger), upload-pack (fetch)
   api.rs      — Read API: refs, log, commit, tree, blob, file-at-ref,
-                search (code + commits, with path/ext filters), stats
-                (using stored_size column, no full table scan)
+                search (code + commits, @prefix: column filter syntax),
+                stats (using stored_size column, no full table scan)
   diff.rs     — Diff engine: recursive tree comparison, line-level diffs
                 (via `similar`), commit diff, two-commit compare
   web.rs      — Web UI: 6 server-rendered HTML pages (home, tree, blob, log,
-                commit, search), branch selector, markdown rendering,
+                commit, search), persistent nav search with live keystroke
+                results, branch selector, markdown rendering,
                 syntax highlighting, line number anchors
 ```
 
@@ -59,8 +61,11 @@ All items below have been implemented and verified.
    (`.`, `_`, `()`, `::`) and falls back to `INSTR(content, ?)`. Full table
    scan but bounded by repo size. `lit:` prefix also forces literal mode.
 
-3. **Scope filters** — `?path=src/` and `?ext=rs` query params narrow results
-   by directory and file type. Works for both FTS5 and INSTR modes.
+3. **Scope filters / @prefix: syntax** — `@path:src/`, `@ext:rs`, `@author:`,
+   `@message:`, `@content:` inline query prefixes replace separate form fields.
+   Parsed in `api::parse_search_query`, strips `@` and maps to FTS5 column
+   filters or SQL LIKE predicates. Auto-routes scope (code vs commits) from
+   the prefix used. Works for both FTS5 and INSTR modes.
 
 4. **Commit message search** — `fts_commits` FTS5 table indexed on hash,
    message, author. Populated during push. Exposed via `?scope=commits` and
@@ -144,6 +149,28 @@ All items below have been implemented and verified.
     `PUT /repo/:name/admin/set-ref` manually sets a ref for recovery from
     partial push timeouts.
 
+22. **Persistent nav search with live results** — Search bar in the nav on
+    every page. Fetches `/search?q=...` on each keystroke (200ms debounce),
+    shows a dropdown of file paths + first matching line (code) or commit hash
+    + message (commits). Enter navigates to the full search page. Scope
+    (code vs commits) detected client-side from `@author:`/`@message:` prefixes.
+
+23. **Arc-based zero-copy resolve cache** — `ResolveCache` stores `Arc<[u8]>`
+    instead of `Vec<u8>`. Cache hits return `Arc::clone` (pointer increment,
+    no data copy). `ExternalObjects` also uses `Arc<[u8]>`. `resolve_entry`
+    returns `Arc<[u8]>` — each decompressed object is allocated exactly once
+    and shared between the cache and the caller. During a processing loop,
+    the Arc is at refcount 2 (cache + caller); caller drops at end of iteration,
+    leaving refcount 1 in cache. `cache.clear()` drops the last reference.
+
+24. **Budget enforcement** — `MAX_PACK_BYTES = 50 MB` hard gate in
+    `handle_receive_pack`: packs above this return a proper `ng` pkt-line
+    response before any object is parsed. `CACHE_BUDGET_BYTES = 20 MB`
+    enforced inside `ResolveCache::try_cache` — cache silently stops growing
+    when the byte budget is exhausted; processing continues via re-decompression.
+    Peak memory ceiling at a 50 MB push: ~85 MB (40 MB below the 128 MB wall).
+    `ResolveCtx` bundles cache + external objects for `resolve_entry`.
+
 ---
 
 ## Known limitations
@@ -158,9 +185,11 @@ These are documented, accepted trade-offs — not bugs.
   Cloudflare's `transactionSync()` API would provide atomicity but is not
   exposed in workers-rs 0.7.5. Use the admin/set-ref endpoint to recover
   from partial push state.
-- **100 MiB request body limit** — Hard Workers platform constraint. Repos
-  whose single-push pack exceeds this must be pushed incrementally via
-  checkpoint commits.
+- **50 MB pack body limit (server-enforced)** — `MAX_PACK_BYTES` in `pack.rs`
+  rejects packs above 50 MB with a clean `ng` response before any object is
+  parsed. The hard Workers platform limit is 100 MB, but we gate lower to keep
+  peak DO memory well under the 128 MB ceiling. Repos must be pushed
+  incrementally via the push script's checkpoint mechanism.
 - **No force push handling** — Untested; may corrupt state or produce
   confusing errors.
 - **No annotated tag objects** — Silently dropped during push. Lightweight
@@ -221,13 +250,6 @@ commit info.
   tag refs). Requires a `tag_objects` table + pack parser changes.
 - **Auth** — Bearer token or Cloudflare Access integration.
 - **Force push** — Detect non-fast-forward pushes, handle ref rewrites safely.
-- **Zero-copy resolve cache** — `ResolveCache` currently copies data on both
-  insert and retrieval (`to_vec()` on cache hit). Switch to `Rc<Vec<u8>>`
-  so cache stores shared ownership — "clone" becomes a refcount bump (8
-  bytes, not megabytes). Downstream functions (`store_commit`, `store_tree`,
-  `store_blob`, `hash_object`) should accept `&[u8]` instead of `Vec<u8>`.
-  Currently mitigated by `try_cache` which skips entries >10 MB, but
-  medium-sized entries (1-10 MB) still get copied unnecessarily on cache hits.
 - **Streaming zlib compression** — Currently `blob_zlib_compress` buffers the
   entire compressed output (2x blob size in memory). Switching to
   `flate2::write::ZlibEncoder` with incremental chunk writes would eliminate
@@ -238,3 +260,4 @@ commit info.
   (10-50 MB) where the compressed copy is significant.
 - **side-band-64k** — Re-add with proper sideband wrapping for progress
   reporting.
+- dont use fetch from DO. expose rpc methods, let worker call the right one.

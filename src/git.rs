@@ -51,6 +51,31 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // partial state may result. Use the admin/set-ref endpoint to recover.
     // TODO: look into getting transaction support in workers-rs
     let pack_data = &body[pack_offset..];
+
+    // Reject oversized packs before any object is parsed.  A clean ng response
+    // is far better than an OOM panic mid-push.  The push script already splits
+    // at 30 MB; this is a server-side safety net.
+    if pack_data.len() > pack::MAX_PACK_BYTES {
+        let reason = format!(
+            "pack too large ({} MB, limit {} MB)",
+            pack_data.len() / 1_000_000,
+            pack::MAX_PACK_BYTES / 1_000_000,
+        );
+        let mut buf = Vec::new();
+        pkt_line_bytes(&mut buf, format!("unpack ng {}\n", reason).as_bytes());
+        for cmd in &commands {
+            pkt_line_bytes(
+                &mut buf,
+                format!("ng {} {}\n", cmd.ref_name, reason).as_bytes(),
+            );
+        }
+        buf.extend_from_slice(b"0000");
+        let mut resp = Response::from_bytes(buf)?;
+        resp.headers_mut()
+            .set("Content-Type", "application/x-git-receive-pack-result")?;
+        return Ok(resp);
+    }
+
     if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
         process_pack_streaming(sql, pack_data, bulk_mode)?;
     }
@@ -118,7 +143,7 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
 
     // Resolve cache: avoids re-decompressing shared delta chain bases.
     // 1024 entries ≈ 20-30 MB, well within DO's 128 MB memory limit.
-    let mut cache = pack::ResolveCache::new(1024);
+    let mut cache = pack::ResolveCache::new(1024, pack::CACHE_BUDGET_BYTES);
 
     // --- Load external bases for thin pack resolution ---
     // Thin packs use REF_DELTAs referencing objects from previous pushes.
@@ -131,12 +156,15 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
                 // Try raw_objects first (commits and trees)
                 if let Ok(Some(raw)) = store::load_raw_object_pub(sql, base_hash) {
                     let obj_type = store::detect_object_type(sql, base_hash);
-                    external.insert(base_hash.clone(), (obj_type, raw));
+                    external.insert(base_hash.clone(), (obj_type, raw.into()));
                 }
                 // Try blobs table (reconstructed from delta chain)
                 else if let Ok(Some(blob_data)) = store::reconstruct_blob_by_hash(sql, base_hash)
                 {
-                    external.insert(base_hash.clone(), (pack::ObjectType::Blob, blob_data));
+                    external.insert(
+                        base_hash.clone(),
+                        (pack::ObjectType::Blob, blob_data.into()),
+                    );
                 }
             }
         }
@@ -155,16 +183,18 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
             &offset_to_idx,
             i,
             &hash_to_idx,
-            &mut cache,
-            &external,
+            &mut pack::ResolveCtx {
+                cache: &mut cache,
+                external: &external,
+            },
         )
         .map_err(|e| Error::RustError(e.0))?;
-        let hash = pack::hash_object(&pack::ObjectType::Commit, &data);
+        let hash = pack::hash_object(&pack::ObjectType::Commit, &*data);
         hash_to_idx.insert(hash.clone(), i);
-        let parsed = store::parse_commit(&data)
+        let parsed = store::parse_commit(&*data)
             .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
         root_tree_hashes.push(parsed.tree_hash.clone());
-        store::store_commit(sql, &hash, &parsed, &data, bulk_mode)?;
+        store::store_commit(sql, &hash, &parsed, &*data, bulk_mode)?;
     }
 
     // --- Process trees ---
@@ -178,13 +208,15 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
             &offset_to_idx,
             i,
             &hash_to_idx,
-            &mut cache,
-            &external,
+            &mut pack::ResolveCtx {
+                cache: &mut cache,
+                external: &external,
+            },
         )
         .map_err(|e| Error::RustError(e.0))?;
-        let hash = pack::hash_object(&pack::ObjectType::Tree, &data);
+        let hash = pack::hash_object(&pack::ObjectType::Tree, &*data);
         hash_to_idx.insert(hash.clone(), i);
-        store::store_tree(sql, &hash, &data)?;
+        store::store_tree(sql, &hash, &*data)?;
     }
 
     // --- Resolve blob paths (all trees now in permanent storage) ---
@@ -207,17 +239,19 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
             &offset_to_idx,
             i,
             &hash_to_idx,
-            &mut cache,
-            &external,
+            &mut pack::ResolveCtx {
+                cache: &mut cache,
+                external: &external,
+            },
         )
         .map_err(|e| Error::RustError(e.0))?;
-        let hash = pack::hash_object(&pack::ObjectType::Blob, &data);
+        let hash = pack::hash_object(&pack::ObjectType::Blob, &*data);
         hash_to_idx.insert(hash.clone(), i);
         let path = blob_paths
             .get(&hash)
             .map(|s| s.as_str())
             .unwrap_or("unknown");
-        store::store_blob(sql, &hash, &data, path, KEYFRAME_INTERVAL)?;
+        store::store_blob(sql, &hash, &*data, path, KEYFRAME_INTERVAL)?;
     }
 
     // --- Handle REF_DELTA entries with unknown types ---
@@ -231,28 +265,30 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
             &offset_to_idx,
             i,
             &hash_to_idx,
-            &mut cache,
-            &external,
+            &mut pack::ResolveCtx {
+                cache: &mut cache,
+                external: &external,
+            },
         );
         match resolved {
             Ok((obj_type, data)) => {
-                let hash = pack::hash_object(&obj_type, &data);
+                let hash = pack::hash_object(&obj_type, &*data);
                 hash_to_idx.insert(hash.clone(), i);
                 match obj_type {
                     pack::ObjectType::Commit => {
-                        let parsed = store::parse_commit(&data)
+                        let parsed = store::parse_commit(&*data)
                             .map_err(|e| Error::RustError(format!("commit {}: {}", hash, e)))?;
-                        store::store_commit(sql, &hash, &parsed, &data, bulk_mode)?;
+                        store::store_commit(sql, &hash, &parsed, &*data, bulk_mode)?;
                     }
                     pack::ObjectType::Tree => {
-                        store::store_tree(sql, &hash, &data)?;
+                        store::store_tree(sql, &hash, &*data)?;
                     }
                     pack::ObjectType::Blob => {
                         let path = blob_paths
                             .get(&hash)
                             .map(|s| s.as_str())
                             .unwrap_or("unknown");
-                        store::store_blob(sql, &hash, &data, path, KEYFRAME_INTERVAL)?;
+                        store::store_blob(sql, &hash, &*data, path, KEYFRAME_INTERVAL)?;
                     }
                     pack::ObjectType::Tag => {}
                 }

@@ -6,6 +6,16 @@
 use flate2::read::ZlibDecoder;
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
+
+/// Packs larger than this are rejected before any objects are parsed.
+/// Keeps peak memory to: body (≤50 MB) + cache (≤20 MB) + WASM/framework (~15 MB) ≈ 85 MB.
+pub const MAX_PACK_BYTES: usize = 50_000_000;
+
+/// Maximum total bytes held in the resolve cache at one time.
+/// When full, new entries are skipped (processing continues with more re-decompression,
+/// but never OOMs due to cache growth).
+pub const CACHE_BUDGET_BYTES: usize = 20_000_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -194,35 +204,54 @@ pub fn resolve_type(
 
 /// Bounded cache for resolved pack entries.  Avoids re-decompressing shared
 /// delta chain bases — critical for git packs with deep chains (up to 50).
-/// Keyed by entry index.  Bounded by entry count (~20-30 MB at 1024 entries).
+/// Keyed by entry index.
+///
+/// Entries are stored as `Arc<[u8]>` so cache hits return a pointer increment
+/// rather than a full data copy.  Multiple entries sharing the same delta base
+/// all hold an Arc clone — one allocation, many readers.
+///
+/// The cache enforces two independent limits:
+///   - `max_entries`: caps the number of cached objects (index space)
+///   - `budget`: caps total cached bytes (memory space)
+/// When either limit is hit, new entries are silently skipped — processing
+/// continues correctly via re-decompression, just without the cache speedup.
 pub struct ResolveCache {
-    entries: HashMap<usize, (ObjectType, Vec<u8>)>,
+    entries: HashMap<usize, (ObjectType, Arc<[u8]>)>,
     max_entries: usize,
+    budget: usize,       // maximum total bytes across all cached entries
+    cached_bytes: usize, // current total bytes held in the cache
 }
 
 impl ResolveCache {
-    pub fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize, budget: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(max_entries),
             max_entries,
+            budget,
+            cached_bytes: 0,
         }
     }
 
-    fn get(&self, idx: usize) -> Option<(ObjectType, &[u8])> {
-        self.entries.get(&idx).map(|(t, d)| (*t, d.as_slice()))
+    /// Return a shared handle to the cached entry.  `Arc::clone` is a pointer
+    /// increment — no data is copied regardless of object size.
+    fn get(&self, idx: usize) -> Option<(ObjectType, Arc<[u8]>)> {
+        self.entries.get(&idx).map(|(t, d)| (*t, Arc::clone(d)))
     }
 
     /// Maximum size of a single cached entry (10 MB). Entries larger than
-    /// this are not cached — they'd consume too much of the 128 MB DO memory
-    /// budget. Large blobs (e.g. 87 MB pickle files) are unlikely to be delta
-    /// bases for other pack entries.
+    /// this are not cached — large blobs are unlikely to be delta bases and
+    /// would exhaust the budget immediately.
     const MAX_ENTRY_SIZE: usize = 10_000_000;
 
-    /// Cache an entry only if it's small enough and there's room. Clones the
-    /// data only when actually caching — zero-copy for large entries.
-    fn try_cache(&mut self, idx: usize, obj_type: ObjectType, data: &[u8]) {
-        if self.entries.len() < self.max_entries && data.len() <= Self::MAX_ENTRY_SIZE {
-            self.entries.insert(idx, (obj_type, data.to_vec()));
+    /// Cache an entry if it fits within both the per-entry size cap and the
+    /// total byte budget.  Takes the Arc by value — caller constructs it once.
+    fn try_cache(&mut self, idx: usize, obj_type: ObjectType, data: Arc<[u8]>) {
+        if self.entries.len() < self.max_entries
+            && data.len() <= Self::MAX_ENTRY_SIZE
+            && self.cached_bytes + data.len() <= self.budget
+        {
+            self.cached_bytes += data.len();
+            self.entries.insert(idx, (obj_type, data));
         }
     }
 
@@ -230,8 +259,16 @@ impl ResolveCache {
         self.entries.contains_key(&idx)
     }
 
-    /// Drop all cached entries to reclaim memory.
+    /// How many bytes are currently held across all cached entries.
+    /// Exposed for observability (e.g. stats endpoint, logging).
+    #[allow(dead_code)]
+    pub fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+
+    /// Drop all cached entries and reset the byte counter.
     pub fn clear(&mut self) {
+        self.cached_bytes = 0;
         self.entries.clear();
     }
 }
@@ -247,44 +284,62 @@ impl ResolveCache {
 /// When a REF_DELTA references an object not in the current pack, it's
 /// looked up here. This handles incremental pushes where git deltifies
 /// trees/blobs against objects from previous pushes.
-pub type ExternalObjects = HashMap<String, (ObjectType, Vec<u8>)>;
+/// External objects loaded from the database for thin pack resolution.
+/// Stored as `Arc<[u8]>` so they can be passed into the cache without copying
+/// when they become delta bases for pack entries.
+pub type ExternalObjects = HashMap<String, (ObjectType, Arc<[u8]>)>;
 
+/// Resolution context passed to `resolve_entry`.
+///
+/// Bundles the mutable cache and the read-only external objects map so
+/// `resolve_entry` takes one context argument instead of growing its parameter
+/// list every time a new concern is added.
+pub struct ResolveCtx<'a> {
+    pub cache: &'a mut ResolveCache,
+    pub external: &'a ExternalObjects,
+}
+
+/// Resolve a single pack entry into its final (type, data).
+///
+/// Returns an `Arc<[u8]>` so the resolved bytes can be shared between the
+/// cache and the caller without any additional copy.  A cache hit is a single
+/// atomic pointer increment; the base object for a depth-50 delta chain is
+/// allocated exactly once regardless of how many entries reference it.
 pub fn resolve_entry(
     data: &[u8],
     index: &[PackEntryMeta],
     offset_to_idx: &HashMap<usize, usize>,
     entry_idx: usize,
     hash_to_idx: &HashMap<String, usize>,
-    cache: &mut ResolveCache,
-    external: &ExternalObjects,
-) -> Result<(ObjectType, Vec<u8>)> {
-    // Check cache for exact entry
-    if let Some((obj_type, cached)) = cache.get(entry_idx) {
-        return Ok((obj_type, cached.to_vec()));
+    ctx: &mut ResolveCtx<'_>,
+) -> Result<(ObjectType, Arc<[u8]>)> {
+    // Cache hit: Arc::clone happened inside get() — no data copy.
+    if let Some((obj_type, cached)) = ctx.cache.get(entry_idx) {
+        return Ok((obj_type, cached));
     }
 
     let entry = &index[entry_idx];
 
-    // Non-delta: decompress and return. Cache only small entries (no clone for large).
+    // Non-delta: decompress once, wrap in Arc, share between cache and caller.
     if let Some(obj_type) = ObjectType::from_type_num(entry.type_num) {
         let (decompressed, _) = zlib_decompress(data, entry.data_offset, entry.size)?;
-        cache.try_cache(entry_idx, obj_type, &decompressed);
-        return Ok((obj_type, decompressed));
+        let arc: Arc<[u8]> = decompressed.into();
+        ctx.cache.try_cache(entry_idx, obj_type, Arc::clone(&arc));
+        return Ok((obj_type, arc));
     }
 
-    // Delta: walk chain, stopping early if we hit a cached entry
+    // Delta: walk the chain back to a non-delta or cached base.
     let mut chain: Vec<usize> = Vec::new();
     let mut current = entry_idx;
 
     loop {
-        // Check if this entry is already resolved in cache
-        if cache.contains(current) && current != entry_idx {
-            break; // use cached entry as base
+        if ctx.cache.contains(current) && current != entry_idx {
+            break; // cached base found — stop walking
         }
 
         let e = &index[current];
         match e.type_num {
-            1..=4 => break, // found non-delta base
+            1..=4 => break, // non-delta base
             6 => {
                 chain.push(current);
                 let base_offset = e
@@ -305,11 +360,7 @@ pub fn resolve_entry(
                     .ok_or_else(|| ParseError("REF_DELTA missing base_hash".into()))?;
                 if let Some(&idx) = hash_to_idx.get(base_hash.as_str()) {
                     current = idx;
-                } else if external.contains_key(base_hash.as_str()) {
-                    // Base is from a previous push — stop chain walk here,
-                    // we'll use the external object as the base below.
-                    // Don't keep current in chain: the REF_DELTA resolution
-                    // in "Resolve base" already applies this entry's delta.
+                } else if ctx.external.contains_key(base_hash.as_str()) {
                     chain.pop();
                     break;
                 } else {
@@ -328,39 +379,48 @@ pub fn resolve_entry(
         }
     }
 
-    // Resolve base — from cache, external objects, or by decompression
-    let (base_type, mut result) = if let Some((t, d)) = cache.get(current) {
-        (t, d.to_vec())
+    // Resolve base — Arc from cache (pointer increment), external object
+    // (already Arc), or fresh decompression wrapped in Arc.
+    let (base_type, mut result): (ObjectType, Arc<[u8]>) = if let Some((t, d)) =
+        ctx.cache.get(current)
+    {
+        (t, d) // Arc::clone already happened in get()
     } else if index[current].type_num == 7 {
-        // REF_DELTA whose base is external (from a previous push)
+        // REF_DELTA base is an external object from a previous push.
         let base_hash = index[current]
             .base_hash
             .as_ref()
             .ok_or_else(|| ParseError("REF_DELTA missing base_hash".into()))?;
-        let (obj_type, base_data) = external
+        let (obj_type, base_data) = ctx
+            .external
             .get(base_hash.as_str())
             .ok_or_else(|| ParseError(format!("external base {} not found", base_hash)))?;
-        // Apply this entry's delta on top of the external base
         let (delta_data, _) =
             zlib_decompress(data, index[current].data_offset, index[current].size)?;
-        let resolved = apply_git_delta(base_data, &delta_data)?;
-        cache.try_cache(current, *obj_type, &resolved);
-        (*obj_type, resolved)
+        let resolved = apply_git_delta(&**base_data, &delta_data)?;
+        let arc: Arc<[u8]> = resolved.into();
+        ctx.cache.try_cache(current, *obj_type, Arc::clone(&arc));
+        (*obj_type, arc)
     } else {
         let t = ObjectType::from_type_num(index[current].type_num)
             .ok_or_else(|| ParseError(format!("invalid base type {}", index[current].type_num)))?;
         let (decompressed, _) =
             zlib_decompress(data, index[current].data_offset, index[current].size)?;
-        cache.try_cache(current, t, &decompressed);
-        (t, decompressed)
+        let arc: Arc<[u8]> = decompressed.into();
+        ctx.cache.try_cache(current, t, Arc::clone(&arc));
+        (t, arc)
     };
 
-    // Apply deltas from innermost to outermost. Cache only small intermediates.
+    // Apply deltas innermost-first.  Each step: decompress delta payload,
+    // apply instructions against the current base (deref Arc to &[u8]),
+    // wrap result in a new Arc, cache it, advance.
     for &delta_idx in chain.iter().rev() {
         let (delta_data, _) =
             zlib_decompress(data, index[delta_idx].data_offset, index[delta_idx].size)?;
-        result = apply_git_delta(&result, &delta_data)?;
-        cache.try_cache(delta_idx, base_type, &result);
+        let next = apply_git_delta(&*result, &delta_data)?;
+        let arc: Arc<[u8]> = next.into();
+        ctx.cache.try_cache(delta_idx, base_type, Arc::clone(&arc));
+        result = arc;
     }
 
     Ok((base_type, result))

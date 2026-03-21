@@ -4,8 +4,27 @@
 //! no static assets, no framework. Highlight.js loaded from CDN for
 //! syntax highlighting in the file viewer.
 
-use crate::{api, diff, store};
+use crate::{
+    api, diff,
+    presentation::{self, Action, Hint, NegotiatedRepresentation},
+    store,
+};
 use worker::*;
+
+mod commit;
+mod home;
+mod log;
+mod search;
+mod settings;
+mod tree_blob;
+
+pub(crate) use commit::page_commit;
+pub(crate) use commit::{page_commit_markdown, page_diff_markdown};
+pub(crate) use home::{page_home, page_home_markdown};
+pub(crate) use log::{page_log, page_log_markdown};
+pub(crate) use search::{page_search, page_search_markdown};
+pub(crate) use settings::{page_settings, page_settings_markdown};
+pub(crate) use tree_blob::{page_blob, page_blob_markdown, page_tree, page_tree_markdown};
 
 type Url = worker::Url;
 
@@ -695,353 +714,6 @@ h2 { font-size: 16px; margin-bottom: 12px; }
 "#;
 
 // ---------------------------------------------------------------------------
-// Page: Repository home
-// ---------------------------------------------------------------------------
-
-pub fn page_home(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    url: &Url,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    // Use ?ref= param if provided, otherwise detect default branch
-    let (ref_name, head_hash) = if let Some(r) = api::get_query(url, "ref") {
-        let hash = api::resolve_ref(sql, &r)?;
-        (r, hash)
-    } else {
-        resolve_default_branch(sql)?
-    };
-
-    let content = match head_hash {
-        Some(hash) => {
-            let tree_hash = load_tree_for_commit(sql, &hash)?;
-            let entries = load_sorted_tree(sql, &tree_hash)?;
-
-            let mut html = String::new();
-
-            // Branch selector
-            html.push_str(&render_branch_selector(
-                sql, owner, repo_name, &ref_name, "home", "",
-            )?);
-
-            // File tree
-            html.push_str(r#"<table class="tree-table">"#);
-            for e in &entries {
-                let icon = if e.is_tree { "&#128193;" } else { "&#128196;" };
-                let link = if e.is_tree {
-                    format!("/{}/{}/tree/{}/{}", owner, repo_name, ref_name, e.name)
-                } else {
-                    format!("/{}/{}/blob/{}/{}", owner, repo_name, ref_name, e.name)
-                };
-                html.push_str(&format!(
-                    r#"<tr><td class="tree-icon">{icon}</td><td class="tree-name"><a href="{link}">{name}</a></td></tr>"#,
-                    icon = icon,
-                    link = link,
-                    name = html_escape(&e.name),
-                ));
-            }
-            html.push_str("</table>");
-
-            // Recent commits
-            html.push_str(r#"<h2 style="margin-top:24px">Recent commits</h2>"#);
-            html.push_str(&render_commit_list(sql, &hash, 5, owner, repo_name)?);
-
-            // README
-            html.push_str(&render_readme(
-                sql, &tree_hash, owner, repo_name, &ref_name,
-            )?);
-
-            html
-        }
-        None => {
-            if actor_name == Some(owner) {
-                // Show push instructions for the repo owner
-                let host = url.host_str().unwrap_or("your-worker.dev");
-                let scheme = url.scheme();
-                format!(
-                    r#"<div class="empty-repo">
-<h2>This repository is empty</h2>
-<p>Push your first commit to get started:</p>
-<pre class="push-cmd">cd my-project
-git init
-git add .
-git commit -m "initial commit"
-git remote add origin {scheme}://{owner}:TOKEN@{host}/{owner}/{repo_name}
-git push origin main</pre>
-<p class="push-note">Replace <code>TOKEN</code> with an access token from <a href="/settings">Settings</a>.</p>
-</div>"#,
-                    scheme = scheme,
-                    owner = owner,
-                    repo_name = repo_name,
-                    host = host,
-                )
-            } else {
-                "<p class=\"empty-repo-msg\">Empty repository.</p>".to_string()
-            }
-        }
-    };
-
-    html_response(&layout(
-        "Home", owner, repo_name, &ref_name, actor_name, &content,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Page: Tree browser
-// ---------------------------------------------------------------------------
-
-pub fn page_tree(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    ref_name: &str,
-    path: &str,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    let commit_hash = match api::resolve_ref(sql, ref_name)? {
-        Some(h) => h,
-        None => return Response::error("ref not found", 404),
-    };
-
-    let tree_hash = resolve_path_to_tree(sql, &commit_hash, path)?;
-    let entries = load_sorted_tree(sql, &tree_hash)?;
-
-    let mut html = String::new();
-
-    // Branch selector
-    html.push_str(&render_branch_selector(
-        sql, owner, repo_name, ref_name, "tree", path,
-    )?);
-
-    // Breadcrumb
-    html.push_str(&render_breadcrumb(owner, repo_name, ref_name, path, true));
-
-    // Tree table
-    html.push_str(r#"<table class="tree-table">"#);
-    // Parent directory link
-    if !path.is_empty() {
-        let parent = parent_path(path);
-        let parent_link = if parent.is_empty() {
-            format!("/{}/{}/", owner, repo_name)
-        } else {
-            format!("/{}/{}/tree/{}/{}", owner, repo_name, ref_name, parent)
-        };
-        html.push_str(&format!(
-            r#"<tr><td class="tree-icon">&#128193;</td><td class="tree-name"><a href="{}">..</a></td></tr>"#,
-            parent_link
-        ));
-    }
-
-    for e in &entries {
-        let icon = if e.is_tree { "&#128193;" } else { "&#128196;" };
-        let full = if path.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{}/{}", path, e.name)
-        };
-        let link = if e.is_tree {
-            format!("/{}/{}/tree/{}/{}", owner, repo_name, ref_name, full)
-        } else {
-            format!("/{}/{}/blob/{}/{}", owner, repo_name, ref_name, full)
-        };
-        html.push_str(&format!(
-            r#"<tr><td class="tree-icon">{icon}</td><td class="tree-name"><a href="{link}">{name}</a></td></tr>"#,
-            icon = icon,
-            link = link,
-            name = html_escape(&e.name),
-        ));
-    }
-    html.push_str("</table>");
-
-    html_response(&layout(path, owner, repo_name, ref_name, actor_name, &html))
-}
-
-// ---------------------------------------------------------------------------
-// Page: Blob viewer
-// ---------------------------------------------------------------------------
-
-pub fn page_blob(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    ref_name: &str,
-    path: &str,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    let commit_hash = match api::resolve_ref(sql, ref_name)? {
-        Some(h) => h,
-        None => return Response::error("ref not found", 404),
-    };
-
-    let blob_hash = resolve_path_to_blob(sql, &commit_hash, path)?;
-    let content = load_blob(sql, &blob_hash)?;
-
-    let mut html = String::new();
-
-    // Branch selector
-    html.push_str(&render_branch_selector(
-        sql, owner, repo_name, ref_name, "blob", path,
-    )?);
-
-    // Breadcrumb
-    html.push_str(&render_breadcrumb(owner, repo_name, ref_name, path, false));
-
-    // File header
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    let size = content.len();
-    html.push_str(&format!(
-        r#"<div class="file-header"><span>{filename}</span><div style="display:flex;gap:8px;align-items:center"><span style="color:#656d76;font-size:13px">{size} bytes</span><a href="/{owner}/{repo}/raw/{ref_name}/{path}" class="raw-btn">Raw</a></div></div>"#,
-        owner = html_escape(owner),
-        repo = html_escape(repo_name),
-        ref_name = html_escape(ref_name),
-        path = path,
-        filename = html_escape(filename),
-        size = size,
-    ));
-
-    // File content
-    let is_bin = content.len().min(8192) > 0 && content[..content.len().min(8192)].contains(&0);
-    if is_bin {
-        html.push_str(r#"<div class="file-content"><pre>Binary file not shown.</pre></div>"#);
-    } else {
-        let text = String::from_utf8_lossy(&content);
-        let lang_class = lang_from_filename(filename);
-        html.push_str(&format!(
-            r#"<div class="file-content"><pre><code class="{lang}">{code}</code></pre></div>"#,
-            lang = lang_class,
-            code = html_escape(&text),
-        ));
-    }
-
-    html_response(&layout(
-        filename, owner, repo_name, ref_name, actor_name, &html,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Raw file serving
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Page: Repo settings (/:owner/:repo/settings) — owner only
-// ---------------------------------------------------------------------------
-
-pub fn page_settings(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    // Stats — use sql.database_size() for DB size (Cloudflare's DO-native API,
-    // not a raw PRAGMA which is blocked by the DO SQLite authorizer)
-    #[derive(serde::Deserialize)]
-    struct N {
-        n: i64,
-    }
-
-    let commits = sql
-        .exec("SELECT COUNT(*) AS n FROM commits", None)?
-        .to_array::<N>()?
-        .first()
-        .map(|r| r.n)
-        .unwrap_or(0);
-    let blobs = sql
-        .exec("SELECT COUNT(*) AS n FROM blobs", None)?
-        .to_array::<N>()?
-        .first()
-        .map(|r| r.n)
-        .unwrap_or(0);
-    let db_bytes = sql.database_size();
-    let db_mb = db_bytes as f64 / 1_048_576.0;
-
-    let default_branch =
-        store::get_config(sql, "default_branch")?.unwrap_or_else(|| "refs/heads/main".to_string());
-
-    let action = |sub: &str| format!("/{}/{}/settings/{}", owner, repo_name, sub);
-
-    let mut html = String::new();
-
-    // Stats
-    html.push_str(&format!(r#"
-<section class="settings-section">
-  <h2>Repository stats</h2>
-  <div class="stats-grid">
-    <div class="stat-box"><div class="stat-val">{commits}</div><div class="stat-lbl">commits</div></div>
-    <div class="stat-box"><div class="stat-val">{blobs}</div><div class="stat-lbl">blobs</div></div>
-    <div class="stat-box"><div class="stat-val">{db_mb:.1} MB</div><div class="stat-lbl">database size</div></div>
-  </div>
-</section>"#,
-        commits = commits,
-        blobs = blobs,
-        db_mb = db_mb,
-    ));
-
-    // Index management
-    html.push_str(&format!(
-        r#"
-<section class="settings-section">
-  <h2>Search indexes</h2>
-  <p class="settings-hint">Rebuild after a bulk push or if search results look stale.</p>
-  <div class="action-row">
-    <form method="POST" action="{commit_graph}">
-      <button class="btn-action" type="submit">Rebuild commit graph</button>
-      <span class="action-hint">Required for commit history and log</span>
-    </form>
-    <form method="POST" action="{fts_commits}">
-      <button class="btn-action" type="submit">Rebuild commit search</button>
-      <span class="action-hint">Full-text search over commit messages</span>
-    </form>
-    <form method="POST" action="{fts_head}">
-      <button class="btn-action" type="submit">Rebuild code search</button>
-      <span class="action-hint">Full-text search over file contents (slow on large repos)</span>
-    </form>
-  </div>
-</section>"#,
-        commit_graph = action("rebuild-graph"),
-        fts_commits = action("rebuild-fts-commits"),
-        fts_head = action("rebuild-fts"),
-    ));
-
-    // Default branch config
-    html.push_str(&format!(r#"
-<section class="settings-section">
-  <h2>Default branch</h2>
-  <form method="POST" action="{action}" class="inline-form">
-    <input type="text" name="branch" value="{branch}" class="branch-input" placeholder="refs/heads/main">
-    <button class="btn-action" type="submit">Save</button>
-  </form>
-</section>"#,
-        action = action("default-branch"),
-        branch = html_escape(&default_branch),
-    ));
-
-    // Danger zone
-    html.push_str(&format!(r#"
-<section class="settings-section settings-danger">
-  <h2>Danger zone</h2>
-  <p class="settings-hint">This will permanently delete all data for <strong>{owner}/{repo}</strong>. There is no undo.</p>
-  <form method="POST" action="{action}" class="inline-form">
-    <input type="text" name="confirm" placeholder='Type "{owner}/{repo}" to confirm' class="branch-input danger-confirm">
-    <button class="btn-danger-action" type="submit">Delete repository</button>
-  </form>
-</section>"#,
-        owner = html_escape(owner),
-        repo = html_escape(repo_name),
-        action = action("delete"),
-    ));
-
-    html_response(&layout(
-        "Settings",
-        owner,
-        repo_name,
-        &default_branch,
-        actor_name,
-        &html,
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // Page: Owner profile (/:owner/)
 // Handled at the Worker level since there is no per-owner DO.
 // ---------------------------------------------------------------------------
@@ -1179,6 +851,78 @@ git push origin main</pre>
     Ok(resp)
 }
 
+pub fn page_owner_profile_markdown(
+    owner: &str,
+    actor_name: Option<&str>,
+    url: &Url,
+    repos: &[String],
+    selection: &NegotiatedRepresentation,
+) -> Result<Response> {
+    let is_owner = actor_name == Some(owner);
+    let host = url.host_str().unwrap_or("your-worker.dev");
+    let scheme = url.scheme();
+
+    let mut markdown = format!("# {}\n\nRepositories: `{}`\n", owner, repos.len());
+
+    if repos.is_empty() {
+        if is_owner {
+            markdown.push_str("\nNo repositories yet. Repositories are created on first push.\n");
+            markdown.push_str("\n## First Push\n\n```bash\n");
+            markdown.push_str("cd my-project\n");
+            markdown.push_str("git init\n");
+            markdown.push_str("git add .\n");
+            markdown.push_str("git commit -m \"initial commit\"\n");
+            markdown.push_str(&format!(
+                "git remote add origin {}://{}:TOKEN@{}/{}/my-project\n",
+                scheme, owner, host, owner
+            ));
+            markdown.push_str("git push origin main\n");
+            markdown.push_str("```\n");
+        } else {
+            markdown.push_str("\nNo public repositories.\n");
+        }
+    } else {
+        markdown.push_str("\n## Repositories (GET paths)\n");
+        for repo in repos {
+            markdown.push_str(&format!("- `{}` - `/{}/{}`\n", repo, owner, repo));
+        }
+
+        if is_owner {
+            markdown.push_str("\n## Push a New Repository\n\n```bash\n");
+            markdown.push_str("cd my-project\n");
+            markdown.push_str("git init\n");
+            markdown.push_str("git add .\n");
+            markdown.push_str("git commit -m \"initial commit\"\n");
+            markdown.push_str(&format!(
+                "git remote add origin {}://{}:TOKEN@{}/{}/my-project\n",
+                scheme, owner, host, owner
+            ));
+            markdown.push_str("git push origin main\n");
+            markdown.push_str("```\n");
+        }
+    }
+
+    let mut actions = vec![Action::get(
+        format!("/{}/", owner),
+        "reload this owner profile",
+    )];
+    if is_owner {
+        actions.push(Action::get("/settings", "open account settings"));
+    }
+
+    let hints = vec![
+        presentation::text_navigation_hint(*selection),
+        Hint::new("Repository paths listed above are GET routes under this owner."),
+        Hint::new(
+            "Repositories are created on first push; there is no separate create-repo endpoint.",
+        ),
+    ];
+
+    markdown.push_str(&presentation::render_actions_section(&actions));
+    markdown.push_str(&presentation::render_hints_section(&hints));
+    presentation::markdown_response(&markdown, selection)
+}
+
 // ---------------------------------------------------------------------------
 // Raw file serving
 // ---------------------------------------------------------------------------
@@ -1238,369 +982,25 @@ fn raw_content_type(filename: &str, content: &[u8]) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Page: Commit log
-// ---------------------------------------------------------------------------
-
-pub fn page_log(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    url: &Url,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    let ref_name = api::get_query(url, "ref").unwrap_or_else(|| {
-        resolve_default_branch(sql)
-            .map(|(name, _)| name)
-            .unwrap_or_else(|_| "main".to_string())
-    });
-    let page: i64 = api::get_query(url, "page")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .max(1);
-    let per_page: i64 = 30;
-    let offset = (page - 1) * per_page;
-
-    let head = match api::resolve_ref(sql, &ref_name)? {
-        Some(h) => h,
-        None => {
-            return html_response(&layout(
-                "Commits",
-                owner,
-                repo_name,
-                &ref_name,
-                actor_name,
-                "<p>No commits yet.</p>",
-            ))
-        }
-    };
-
-    // Walk commit chain
-    let commits = walk_commits(sql, &head, per_page + 1, offset)?;
-    let has_next = commits.len() as i64 > per_page;
-    let display: Vec<_> = commits.into_iter().take(per_page as usize).collect();
-
-    let mut html = String::new();
-
-    // Branch selector
-    html.push_str(&render_branch_selector(
-        sql, owner, repo_name, &ref_name, "log", "",
-    )?);
-
-    html.push_str(&format!(
-        r#"<h1>Commits on <strong>{}</strong></h1>"#,
-        html_escape(&ref_name)
-    ));
-
-    html.push_str(r#"<ul class="commit-list">"#);
-    for c in &display {
-        html.push_str(&format!(
-            r#"<li class="commit-item">
-  <a class="commit-hash" href="/{owner}/{repo}/commit/{hash}">{short}</a>
-  <span class="commit-msg"><a href="/{owner}/{repo}/commit/{hash}">{msg}</a></span>
-  <span class="commit-author">{author}</span>
-  <span class="commit-time">{time}</span>
-</li>"#,
-            owner = owner,
-            repo = repo_name,
-            hash = c.hash,
-            short = &c.hash[..7.min(c.hash.len())],
-            msg = html_escape(&first_line(&c.message)),
-            author = html_escape(&c.author),
-            time = format_time(c.commit_time),
-        ));
-    }
-    html.push_str("</ul>");
-
-    // Pagination
-    html.push_str(r#"<div class="pagination">"#);
-    if page > 1 {
-        html.push_str(&format!(
-            r#"<a href="/{}/{}/commits?ref={}&page={}">Previous</a>"#,
-            owner,
-            repo_name,
-            ref_name,
-            page - 1
-        ));
-    }
-    if has_next {
-        html.push_str(&format!(
-            r#"<a href="/{}/{}/commits?ref={}&page={}">Next</a>"#,
-            owner,
-            repo_name,
-            ref_name,
-            page + 1
-        ));
-    }
-    html.push_str("</div>");
-
-    html_response(&layout(
-        "Commits", owner, repo_name, &ref_name, actor_name, &html,
-    ))
+struct CommitListItem {
+    hash: String,
+    short_hash: String,
+    subject: String,
+    author: String,
+    relative_time: String,
 }
 
-// ---------------------------------------------------------------------------
-// Page: Commit detail with diff
-// ---------------------------------------------------------------------------
-
-pub fn page_commit(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    hash: &str,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    if hash.is_empty() {
-        return Response::error("missing commit hash", 400);
-    }
-
-    // Load commit metadata
-    let (default_branch, _) = resolve_default_branch(sql)?;
-    let commit = load_commit_meta(sql, hash)?;
-    let diff_result = diff::diff_commit(sql, hash, true, 3)?;
-
-    let mut html = String::new();
-
-    // Commit header
-    html.push_str(&format!(
-        r#"<h1 style="font-size:18px;margin-bottom:4px">{msg}</h1>"#,
-        msg = html_escape(&first_line(&commit.message)),
-    ));
-    html.push_str(&format!(
-        r#"<p style="color:#656d76;margin-bottom:16px">{author} &lt;{email}&gt; committed {time}</p>"#,
-        author = html_escape(&commit.author),
-        email = html_escape(&commit.author_email),
-        time = format_time(commit.commit_time),
-    ));
-
-    // Full message if multi-line
-    let rest = rest_of_message(&commit.message);
-    if !rest.is_empty() {
-        html.push_str(&format!(
-            r#"<pre style="margin-bottom:16px;padding:12px;background:#f6f8fa;border-radius:6px;white-space:pre-wrap">{}</pre>"#,
-            html_escape(&rest),
-        ));
-    }
-
-    // Commit info
-    html.push_str(&format!(
-        r#"<div style="font-family:monospace;font-size:13px;margin-bottom:16px;color:#656d76">
-  commit {hash}<br>
-  {parents}
-</div>"#,
-        hash = hash,
-        parents = if let Some(ref p) = diff_result.parent_hash {
-            format!(
-                r#"parent <a href="/{}/{}/commit/{}">{}</a>"#,
-                owner,
-                repo_name,
-                p,
-                &p[..7.min(p.len())]
-            )
-        } else {
-            "root commit".to_string()
-        },
-    ));
-
-    // Stats
-    html.push_str(&format!(
-        r#"<div class="diff-stats">
-  Showing <strong>{files}</strong> changed file{s} with
-  <span class="stat-add">+{add}</span> addition{as_} and
-  <span class="stat-del">-{del}</span> deletion{ds}.
-</div>"#,
-        files = diff_result.stats.files_changed,
-        s = if diff_result.stats.files_changed == 1 {
-            ""
-        } else {
-            "s"
-        },
-        add = diff_result.stats.additions,
-        as_ = if diff_result.stats.additions == 1 {
-            ""
-        } else {
-            "s"
-        },
-        del = diff_result.stats.deletions,
-        ds = if diff_result.stats.deletions == 1 {
-            ""
-        } else {
-            "s"
-        },
-    ));
-
-    // File diffs
-    for file in &diff_result.files {
-        html.push_str(&render_file_diff(file));
-    }
-
-    html_response(&layout(
-        &format!("Commit {}", &hash[..7.min(hash.len())]),
-        owner,
-        repo_name,
-        &default_branch,
-        actor_name,
-        &html,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Page: Search
-// ---------------------------------------------------------------------------
-
-pub fn page_search(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    url: &Url,
-    actor_name: Option<&str>,
-) -> Result<Response> {
-    let raw_query = api::get_query(url, "q").unwrap_or_default();
-    let scope_param = api::get_query(url, "scope").unwrap_or_else(|| "code".to_string());
-
-    // Parse @prefix: tokens out of the query
-    let parsed = api::parse_search_query(&raw_query);
-    let query = parsed.fts_query.clone();
-    let scope = parsed.scope.map(|s| s.to_string()).unwrap_or(scope_param);
-
-    // Resolve default branch for blob links
-    let (default_branch, _) = resolve_default_branch(sql)?;
-
-    let mut html = String::new();
-    html.push_str("<h1>Search</h1>");
-
-    // Scope tabs
-    let code_active = if scope == "code" {
-        " style=\"font-weight:700;text-decoration:underline\""
-    } else {
-        ""
-    };
-    let commits_active = if scope == "commits" {
-        " style=\"font-weight:700;text-decoration:underline\""
-    } else {
-        ""
-    };
-    html.push_str(&format!(
-        r#"<div style="margin-bottom:12px;display:flex;gap:16px">
-  <a href="/{owner}/{repo}/search-ui?q={q}&scope=code"{ca}>Code</a>
-  <a href="/{owner}/{repo}/search-ui?q={q}&scope=commits"{cc}>Commits</a>
-</div>"#,
-        owner = owner,
-        repo = repo_name,
-        q = html_escape(&raw_query),
-        ca = code_active,
-        cc = commits_active,
-    ));
-
-    // Search form — single input, @prefix: syntax handles filtering
-    html.push_str(&format!(
-        r#"<form class="search-form" action="/{owner}/{repo}/search-ui" method="get">
-  <input type="hidden" name="scope" value="{scope}">
-  <input type="text" name="q" value="{q}" placeholder="Search... (@author: @message: @path: @ext: @content:)">
-  <button type="submit">Search</button>
-</form>"#,
-        owner = owner,
-        repo = repo_name,
-        scope = html_escape(&scope),
-        q = html_escape(&raw_query),
-    ));
-
-    if !query.is_empty() || !raw_query.is_empty() {
-        let effective_query = if query.is_empty() { &raw_query } else { &query };
-        if scope == "commits" {
-            // Commit search
-            let results = store::search_commits(sql, effective_query, 50)?;
-            if results.is_empty() {
-                html.push_str("<p>No matching commits found.</p>");
-            } else {
-                html.push_str(&format!(
-                    "<p>{} commit{} found</p>",
-                    results.len(),
-                    if results.len() == 1 { "" } else { "s" }
-                ));
-                html.push_str(r#"<ul class="commit-list">"#);
-                for c in &results {
-                    html.push_str(&format!(
-                        r#"<li class="commit-item">
-  <a class="commit-hash" href="/{owner}/{repo}/commit/{hash}">{short}</a>
-  <span class="commit-msg"><a href="/{owner}/{repo}/commit/{hash}">{msg}</a></span>
-  <span class="commit-author">{author}</span>
-  <span class="commit-time">{time}</span>
-</li>"#,
-                        owner = owner,
-                        repo = repo_name,
-                        hash = c.hash,
-                        short = &c.hash[..7.min(c.hash.len())],
-                        msg = html_escape(&first_line(&c.message)),
-                        author = html_escape(&c.author),
-                        time = format_time(c.commit_time),
-                    ));
-                }
-                html.push_str("</ul>");
-            }
-        } else {
-            // Code search
-            let effective_query = if query.is_empty() { &raw_query } else { &query };
-            let results = store::search_code(
-                sql,
-                effective_query,
-                parsed.path_filter.as_deref(),
-                parsed.ext_filter.as_deref(),
-                50,
-            )?;
-            let total_matches: usize = results.iter().map(|r| r.matches.len()).sum();
-
-            if results.is_empty() {
-                html.push_str("<p>No results found.</p>");
-            } else {
-                html.push_str(&format!(
-                    "<p>{} match{} across {} file{}</p>",
-                    total_matches,
-                    if total_matches == 1 { "" } else { "es" },
-                    results.len(),
-                    if results.len() == 1 { "" } else { "s" },
-                ));
-
-                for r in &results {
-                    html.push_str(r#"<div class="search-result">"#);
-                    html.push_str(&format!(
-                        r#"<div class="search-result-path"><a href="/{owner}/{repo}/blob/{branch}/{path}">{path}</a> ({n} match{s})</div>"#,
-                        owner = owner,
-                        repo = repo_name,
-                        branch = default_branch,
-                        path = html_escape(&r.path),
-                        n = r.matches.len(),
-                        s = if r.matches.len() == 1 { "" } else { "es" },
-                    ));
-
-                    // Show matching lines with line numbers
-                    html.push_str(r#"<table class="diff-table" style="margin-top:4px">"#);
-                    for m in &r.matches {
-                        html.push_str(&format!(
-                            r#"<tr class="diff-line-add"><td class="diff-ln"><a href="/{owner}/{repo}/blob/{branch}/{path}#L{ln}" style="color:#656d76">{ln}</a></td><td>{text}</td></tr>"#,
-                            owner = owner,
-                            repo = repo_name,
-                            branch = default_branch,
-                            path = html_escape(&r.path),
-                            ln = m.line_number,
-                            text = html_escape(&m.line_text),
-                        ));
-                    }
-                    html.push_str("</table>");
-                    html.push_str("</div>");
-                }
-            }
-        }
-    }
-
-    html_response(&layout(
-        "Search",
-        owner,
-        repo_name,
-        &default_branch,
-        actor_name,
-        &html,
-    ))
+fn summarize_commits(commits: Vec<CommitMeta>) -> Vec<CommitListItem> {
+    commits
+        .into_iter()
+        .map(|commit| CommitListItem {
+            short_hash: commit.hash[..7.min(commit.hash.len())].to_string(),
+            subject: first_line(&commit.message),
+            author: commit.author,
+            relative_time: format_time(commit.commit_time),
+            hash: commit.hash,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,136 +1091,37 @@ pub(crate) fn render_file_diff(file: &diff::FileDiff) -> String {
 // ---------------------------------------------------------------------------
 
 fn render_commit_list(
-    sql: &SqlStorage,
-    head: &str,
-    limit: i64,
+    commits: &[CommitListItem],
     owner: &str,
     repo_name: &str,
-) -> Result<String> {
-    let commits = walk_commits(sql, head, limit, 0)?;
+    show_author: bool,
+) -> String {
     let mut html = String::new();
     html.push_str(r#"<ul class="commit-list">"#);
-    for c in &commits {
+    for commit in commits {
+        let commit_path = format!("/{}/{}/commit/{}", owner, repo_name, commit.hash);
         html.push_str(&format!(
             r#"<li class="commit-item">
-  <a class="commit-hash" href="/{owner}/{repo}/commit/{hash}">{short}</a>
-  <span class="commit-msg"><a href="/{owner}/{repo}/commit/{hash}">{msg}</a></span>
+  <a class="commit-hash" href="{commit_path}">{short}</a>
+  <span class="commit-msg"><a href="{commit_path}">{msg}</a></span>
+  {author}
   <span class="commit-time">{time}</span>
 </li>"#,
-            owner = owner,
-            repo = repo_name,
-            hash = c.hash,
-            short = &c.hash[..7.min(c.hash.len())],
-            msg = html_escape(&first_line(&c.message)),
-            time = format_time(c.commit_time),
+            commit_path = html_escape(&commit_path),
+            short = html_escape(&commit.short_hash),
+            msg = html_escape(&commit.subject),
+            author = if !show_author || commit.author.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<span class="commit-author">{}</span>"#,
+                    html_escape(&commit.author)
+                )
+            },
+            time = html_escape(&commit.relative_time),
         ));
     }
     html.push_str("</ul>");
-    Ok(html)
-}
-
-// ---------------------------------------------------------------------------
-// README rendering
-// ---------------------------------------------------------------------------
-
-fn render_readme(
-    sql: &SqlStorage,
-    tree_hash: &str,
-    owner: &str,
-    repo_name: &str,
-    ref_name: &str,
-) -> Result<String> {
-    // Look for README files in the root tree
-    let entries = load_sorted_tree(sql, tree_hash)?;
-    let readme = entries.iter().find(|e| {
-        let lower = e.name.to_lowercase();
-        lower == "readme.md" || lower == "readme" || lower == "readme.txt"
-    });
-
-    let entry = match readme {
-        Some(e) => e,
-        None => return Ok(String::new()),
-    };
-
-    if entry.is_tree {
-        return Ok(String::new());
-    }
-
-    let content = load_blob(sql, &entry.hash)?;
-    let text = match std::str::from_utf8(&content) {
-        Ok(t) => t,
-        Err(_) => return Ok(String::new()),
-    };
-
-    let mut html = String::new();
-    html.push_str(r#"<div class="readme-box">"#);
-    html.push_str(&format!(
-        r#"<div class="readme-header"><a href="/{}/{}/blob/{}/{}">{}</a></div>"#,
-        owner,
-        repo_name,
-        ref_name,
-        entry.name,
-        html_escape(&entry.name),
-    ));
-    html.push_str(r#"<div class="readme-body">"#);
-
-    let is_md = entry.name.to_lowercase().ends_with(".md");
-    if is_md {
-        html.push_str(&render_markdown(text));
-    } else {
-        html.push_str(&format!("<pre>{}</pre>", html_escape(text)));
-    }
-
-    html.push_str("</div></div>");
-    Ok(html)
-}
-
-// ---------------------------------------------------------------------------
-// Breadcrumb rendering
-// ---------------------------------------------------------------------------
-
-fn render_breadcrumb(
-    owner: &str,
-    repo_name: &str,
-    ref_name: &str,
-    path: &str,
-    is_tree: bool,
-) -> String {
-    let mut html = String::from(r#"<div class="breadcrumb">"#);
-    html.push_str(&format!(
-        r#"<a href="/{owner}/{repo}/">{repo}</a> / "#,
-        owner = owner,
-        repo = repo_name,
-    ));
-
-    if path.is_empty() {
-        html.push_str("</div>");
-        return html;
-    }
-
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    for (i, part) in parts.iter().enumerate() {
-        if i < parts.len() - 1 {
-            let sub_path = parts[..=i].join("/");
-            html.push_str(&format!(
-                r#"<a href="/{}/{}/tree/{}/{}">{}</a> / "#,
-                owner,
-                repo_name,
-                ref_name,
-                sub_path,
-                html_escape(part),
-            ));
-        } else {
-            // Last segment
-            if is_tree {
-                html.push_str(&format!("<strong>{}</strong>", html_escape(part),));
-            } else {
-                html.push_str(&format!("<strong>{}</strong>", html_escape(part),));
-            }
-        }
-    }
-
-    html.push_str("</div>");
     html
 }
 
@@ -2129,10 +1430,6 @@ pub(crate) fn resolve_default_branch(sql: &SqlStorage) -> Result<(String, Option
     }
 }
 
-// ---------------------------------------------------------------------------
-// Branch selector
-// ---------------------------------------------------------------------------
-
 fn load_branches(sql: &SqlStorage) -> Result<Vec<String>> {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -2153,54 +1450,6 @@ fn load_branches(sql: &SqlStorage) -> Result<Vec<String>> {
                 .to_string()
         })
         .collect())
-}
-
-/// Render a branch dropdown. `page_type` is "home", "tree", "blob", or "log".
-/// For tree/blob, `path` is the current file path. Navigates on change.
-fn render_branch_selector(
-    sql: &SqlStorage,
-    owner: &str,
-    repo_name: &str,
-    current_ref: &str,
-    page_type: &str,
-    path: &str,
-) -> Result<String> {
-    let branches = load_branches(sql)?;
-
-    if branches.len() <= 1 {
-        // Single branch — just show the name, no dropdown needed
-        return Ok(format!(
-            r#"<div class="branch-selector"><span class="branch-label">branch:</span> <strong>{}</strong></div>"#,
-            html_escape(current_ref)
-        ));
-    }
-
-    let mut html = String::from(
-        r#"<div class="branch-selector"><span class="branch-label">branch:</span> <select onchange="window.location.href=this.value">"#,
-    );
-
-    for branch in &branches {
-        let url = match page_type {
-            "tree" => format!("/{}/{}/tree/{}/{}", owner, repo_name, branch, path),
-            "blob" => format!("/{}/{}/blob/{}/{}", owner, repo_name, branch, path),
-            "log" => format!("/{}/{}/commits?ref={}", owner, repo_name, branch),
-            _ => format!("/{}/{}/?ref={}", owner, repo_name, branch), // home
-        };
-        let selected = if branch == current_ref {
-            " selected"
-        } else {
-            ""
-        };
-        html.push_str(&format!(
-            r#"<option value="{}"{}>{}</option>"#,
-            url,
-            selected,
-            html_escape(branch)
-        ));
-    }
-
-    html.push_str("</select></div>");
-    Ok(html)
 }
 
 // ---------------------------------------------------------------------------
@@ -2387,20 +1636,6 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").to_string()
 }
 
-fn rest_of_message(s: &str) -> String {
-    let mut lines = s.lines();
-    lines.next(); // skip first line
-    let rest: String = lines.collect::<Vec<_>>().join("\n");
-    rest.trim().to_string()
-}
-
-fn parent_path(path: &str) -> String {
-    match path.rfind('/') {
-        Some(pos) => path[..pos].to_string(),
-        None => String::new(),
-    }
-}
-
 pub(crate) fn format_time(unix: i64) -> String {
     // Simple relative time
     let now = js_sys_date_now() / 1000.0;
@@ -2431,44 +1666,4 @@ fn js_sys_date_now() -> f64 {
     // We can't use js_sys directly without adding it as a dependency.
     // Instead, use worker::Date.
     worker::Date::now().as_millis() as f64
-}
-
-fn lang_from_filename(name: &str) -> String {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    let lang = match ext {
-        "rs" => "language-rust",
-        "js" | "mjs" | "cjs" => "language-javascript",
-        "ts" | "mts" | "cts" => "language-typescript",
-        "py" => "language-python",
-        "rb" => "language-ruby",
-        "go" => "language-go",
-        "java" => "language-java",
-        "c" | "h" => "language-c",
-        "cpp" | "cc" | "cxx" | "hpp" => "language-cpp",
-        "cs" => "language-csharp",
-        "swift" => "language-swift",
-        "kt" | "kts" => "language-kotlin",
-        "php" => "language-php",
-        "sh" | "bash" | "zsh" => "language-bash",
-        "json" => "language-json",
-        "yaml" | "yml" => "language-yaml",
-        "toml" => "language-toml",
-        "xml" | "svg" | "html" | "htm" => "language-xml",
-        "css" => "language-css",
-        "scss" | "sass" => "language-scss",
-        "sql" => "language-sql",
-        "md" | "markdown" => "language-markdown",
-        "dockerfile" | "Dockerfile" => "language-dockerfile",
-        "makefile" | "Makefile" => "language-makefile",
-        "zig" => "language-zig",
-        "lua" => "language-lua",
-        "r" | "R" => "language-r",
-        "ex" | "exs" => "language-elixir",
-        "erl" | "hrl" => "language-erlang",
-        "hs" => "language-haskell",
-        "ml" | "mli" => "language-ocaml",
-        "nix" => "language-nix",
-        _ => "",
-    };
-    lang.to_string()
 }

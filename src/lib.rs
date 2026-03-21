@@ -4,10 +4,12 @@ mod git;
 mod issues;
 mod issues_web;
 mod pack;
+mod presentation;
 mod schema;
 mod store;
 mod web;
 
+use crate::presentation::{NegotiatedRepresentation, Representation};
 use worker::*;
 
 /// Delta compression keyframe interval. A full keyframe is stored every N
@@ -35,7 +37,10 @@ fn check_write_access(actor: &Option<Actor>, repo_owner: &str) -> Option<Result<
     match actor {
         None => Some(unauthorized_401()),
         Some(a) if a.display_name == repo_owner => None,
-        Some(_) => Some(Response::error("Forbidden: you don't own this repository", 403)),
+        Some(_) => Some(Response::error(
+            "Forbidden: you don't own this repository",
+            403,
+        )),
     }
 }
 
@@ -58,6 +63,22 @@ fn make_redirect(base_url: &Url, path: &str) -> Result<Response> {
     Response::redirect(url)
 }
 
+fn negotiate_or_response(
+    req: &Request,
+    supported: &[Representation],
+    default: Representation,
+) -> std::result::Result<NegotiatedRepresentation, Result<Response>> {
+    presentation::preferred_representation(req, supported, default)
+        .map_err(|err| err.into_response())
+}
+
+fn finalize_negotiated(
+    response: Result<Response>,
+    selection: &NegotiatedRepresentation,
+) -> Result<Response> {
+    response.and_then(|resp| presentation::finalize_response(resp, selection))
+}
+
 // ---------------------------------------------------------------------------
 // Worker entry point — route to the named Repository DO
 // ---------------------------------------------------------------------------
@@ -78,7 +99,31 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         let actor_name = actor_from_request(&req).map(|a| a.display_name);
         let url = req.url()?;
         let repos = list_repos(&env, owner).await;
-        return web::page_owner_profile(owner, actor_name.as_deref(), &url, &repos);
+        let selection = match negotiate_or_response(
+            &req,
+            &[Representation::Html, Representation::Markdown],
+            Representation::Html,
+        ) {
+            Ok(selection) => selection,
+            Err(resp) => return resp,
+        };
+        return match selection.representation() {
+            Representation::Html => finalize_negotiated(
+                web::page_owner_profile(owner, actor_name.as_deref(), &url, &repos),
+                &selection,
+            ),
+            Representation::Markdown => finalize_negotiated(
+                web::page_owner_profile_markdown(
+                    owner,
+                    actor_name.as_deref(),
+                    &url,
+                    &repos,
+                    &selection,
+                ),
+                &selection,
+            ),
+            Representation::Json => unreachable!(),
+        };
     }
 
     // /:owner/:repo/* — dispatched to a DO instance named "{owner}/{repo}".
@@ -135,15 +180,6 @@ impl DurableObject for Repository {
         // None means anonymous — allowed for reads, denied for writes.
         let actor = actor_from_request(&req);
         let actor_name = actor.as_ref().map(|a| a.display_name.as_str());
-
-        // Does the client want HTML? (browsers send Accept: text/html)
-        let wants_html = req
-            .headers()
-            .get("Accept")
-            .ok()
-            .flatten()
-            .map(|a| a.contains("text/html"))
-            .unwrap_or(false);
 
         match (req.method(), action) {
             // -- Git smart HTTP protocol --
@@ -202,21 +238,94 @@ impl DurableObject for Repository {
             (Method::Get, "search") => api::handle_search(&self.sql, &url),
             (Method::Get, "stats") => api::handle_stats(&self.sql),
 
-            // -- Diff API (always JSON) --
-            (Method::Get, "diff") if !wants_html => {
+            // -- Diff / commit history --
+            (Method::Get, "diff") => {
                 let sha = parts.get(3).unwrap_or(&"");
-                diff::handle_diff(&self.sql, sha, &url)
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[
+                        Representation::Json,
+                        Representation::Html,
+                        Representation::Markdown,
+                    ],
+                    Representation::Json,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Json => {
+                        finalize_negotiated(diff::handle_diff(&self.sql, sha, &url), &selection)
+                    }
+                    Representation::Html => finalize_negotiated(
+                        web::page_commit(&self.sql, owner, repo_name, sha, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_diff_markdown(&self.sql, owner, repo_name, sha, &selection),
+                        &selection,
+                    ),
+                }
             }
             (Method::Get, "compare") => {
                 let spec = parts.get(3).unwrap_or(&"");
                 diff::handle_compare(&self.sql, spec, &url)
             }
 
-            // -- Content-negotiated: JSON for API, HTML for browsers --
-            (Method::Get, "log") if !wants_html => api::handle_log(&self.sql, &url),
-            (Method::Get, "commit") if !wants_html => {
+            (Method::Get, "log") => {
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[
+                        Representation::Json,
+                        Representation::Html,
+                        Representation::Markdown,
+                    ],
+                    Representation::Json,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Json => {
+                        finalize_negotiated(api::handle_log(&self.sql, &url), &selection)
+                    }
+                    Representation::Html => finalize_negotiated(
+                        web::page_log(&self.sql, owner, repo_name, &url, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_log_markdown(&self.sql, owner, repo_name, &url, &selection),
+                        &selection,
+                    ),
+                }
+            }
+            (Method::Get, "commit") => {
                 let hash = parts.get(3).unwrap_or(&"");
-                api::handle_commit(&self.sql, hash)
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[
+                        Representation::Json,
+                        Representation::Html,
+                        Representation::Markdown,
+                    ],
+                    Representation::Json,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Json => {
+                        finalize_negotiated(api::handle_commit(&self.sql, hash), &selection)
+                    }
+                    Representation::Html => finalize_negotiated(
+                        web::page_commit(&self.sql, owner, repo_name, hash, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_commit_markdown(&self.sql, owner, repo_name, hash, &selection),
+                        &selection,
+                    ),
+                }
             }
             // tree/blob by 40-hex hash → JSON API
             (Method::Get, "tree") if is_hex40(parts.get(3).unwrap_or(&"")) => {
@@ -227,43 +336,164 @@ impl DurableObject for Repository {
             }
 
             // -- Web UI --
-            (Method::Get, "") => web::page_home(&self.sql, owner, repo_name, &url, actor_name),
-            (Method::Get, "commits") => web::page_log(&self.sql, owner, repo_name, &url, actor_name),
-            (Method::Get, "commit") | (Method::Get, "diff") => {
-                let hash = parts.get(3).unwrap_or(&"");
-                web::page_commit(&self.sql, owner, repo_name, hash, actor_name)
+            (Method::Get, "") => {
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Html => finalize_negotiated(
+                        web::page_home(&self.sql, owner, repo_name, &url, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_home_markdown(
+                            &self.sql, owner, repo_name, &url, actor_name, &selection,
+                        ),
+                        &selection,
+                    ),
+                    Representation::Json => unreachable!(),
+                }
+            }
+            (Method::Get, "commits") => {
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Html => finalize_negotiated(
+                        web::page_log(&self.sql, owner, repo_name, &url, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_log_markdown(&self.sql, owner, repo_name, &url, &selection),
+                        &selection,
+                    ),
+                    Representation::Json => unreachable!(),
+                }
             }
             (Method::Get, "tree") => {
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
                 let ref_name = parts.get(3).unwrap_or(&"main");
                 let sub_path = if parts.len() > 4 {
                     parts[4..].join("/")
                 } else {
                     String::new()
                 };
-                web::page_tree(&self.sql, owner, repo_name, ref_name, &sub_path, actor_name)
+                match selection.representation() {
+                    Representation::Html => finalize_negotiated(
+                        web::page_tree(
+                            &self.sql, owner, repo_name, ref_name, &sub_path, actor_name,
+                        ),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_tree_markdown(
+                            &self.sql, owner, repo_name, ref_name, &sub_path, &selection,
+                        ),
+                        &selection,
+                    ),
+                    Representation::Json => unreachable!(),
+                }
             }
             (Method::Get, "blob") => {
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
                 let ref_name = parts.get(3).unwrap_or(&"main");
                 let sub_path = if parts.len() > 4 {
                     parts[4..].join("/")
                 } else {
                     String::new()
                 };
-                web::page_blob(&self.sql, owner, repo_name, ref_name, &sub_path, actor_name)
+                match selection.representation() {
+                    Representation::Html => finalize_negotiated(
+                        web::page_blob(
+                            &self.sql, owner, repo_name, ref_name, &sub_path, actor_name,
+                        ),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_blob_markdown(
+                            &self.sql, owner, repo_name, ref_name, &sub_path, &selection,
+                        ),
+                        &selection,
+                    ),
+                    Representation::Json => unreachable!(),
+                }
             }
-            (Method::Get, "search-ui") => web::page_search(&self.sql, owner, repo_name, &url, actor_name),
+            (Method::Get, "search-ui") => {
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Html => finalize_negotiated(
+                        web::page_search(&self.sql, owner, repo_name, &url, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_search_markdown(&self.sql, owner, repo_name, &url, &selection),
+                        &selection,
+                    ),
+                    Representation::Json => unreachable!(),
+                }
+            }
             (Method::Get, "settings") => {
                 if let Some(resp) = check_write_access(&actor, owner) {
                     return resp;
                 }
-                web::page_settings(&self.sql, owner, repo_name, actor_name)
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+                match selection.representation() {
+                    Representation::Html => finalize_negotiated(
+                        web::page_settings(&self.sql, owner, repo_name, actor_name),
+                        &selection,
+                    ),
+                    Representation::Markdown => finalize_negotiated(
+                        web::page_settings_markdown(&self.sql, owner, repo_name, &selection),
+                        &selection,
+                    ),
+                    Representation::Json => unreachable!(),
+                }
             }
             (Method::Post, "settings") => {
                 if let Some(resp) = check_write_access(&actor, owner) {
                     return resp;
                 }
                 let sub = parts.get(3).copied().unwrap_or("");
-                self.handle_settings_action(owner, repo_name, sub, &url, req).await
+                self.handle_settings_action(owner, repo_name, sub, &url, req)
+                    .await
             }
             (Method::Get, "raw") => {
                 let ref_name = parts.get(3).unwrap_or(&"main");
@@ -278,47 +508,161 @@ impl DurableObject for Repository {
             // -- Issues --
             (Method::Get, "issues") => {
                 let sub = parts.get(3).copied().unwrap_or("");
-                match sub {
-                    "" => issues_web::page_issues_list(&self.sql, owner, repo_name, &url, actor_name),
-                    "new" => {
-                        if actor.is_none() { return unauthorized_401(); }
-                        issues_web::page_new_issue(&self.sql, owner, repo_name, actor_name)
+                if sub == "new" && actor.is_none() {
+                    return unauthorized_401();
+                }
+                let issue_number = if sub.is_empty() || sub == "new" {
+                    None
+                } else {
+                    match sub.parse::<i64>() {
+                        Ok(num) => Some(num),
+                        Err(_) => return Response::error("Not Found", 404),
                     }
-                    n => match n.parse::<i64>() {
-                        Ok(num) => issues_web::page_issue_detail(&self.sql, owner, repo_name, num, actor_name),
-                        Err(_) => Response::error("Not Found", 404),
+                };
+
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+
+                match selection.representation() {
+                    Representation::Html => match (sub, issue_number) {
+                        ("", _) => finalize_negotiated(
+                            issues_web::page_issues_list(
+                                &self.sql, owner, repo_name, &url, actor_name,
+                            ),
+                            &selection,
+                        ),
+                        ("new", _) => finalize_negotiated(
+                            issues_web::page_new_issue(&self.sql, owner, repo_name, actor_name),
+                            &selection,
+                        ),
+                        (_, Some(num)) => finalize_negotiated(
+                            issues_web::page_issue_detail(
+                                &self.sql, owner, repo_name, num, actor_name,
+                            ),
+                            &selection,
+                        ),
+                        _ => Response::error("Not Found", 404),
                     },
+                    Representation::Markdown => match (sub, issue_number) {
+                        ("", _) => finalize_negotiated(
+                            issues_web::page_issues_list_markdown(
+                                &self.sql, owner, repo_name, &url, actor_name, &selection,
+                            ),
+                            &selection,
+                        ),
+                        ("new", _) => finalize_negotiated(
+                            issues_web::page_new_issue_markdown(
+                                &self.sql, owner, repo_name, actor_name, &selection,
+                            ),
+                            &selection,
+                        ),
+                        (_, Some(num)) => finalize_negotiated(
+                            issues_web::page_issue_detail_markdown(
+                                &self.sql, owner, repo_name, num, actor_name, &selection,
+                            ),
+                            &selection,
+                        ),
+                        _ => Response::error("Not Found", 404),
+                    },
+                    Representation::Json => unreachable!(),
                 }
             }
             (Method::Post, "issues") => {
-                if actor.is_none() { return unauthorized_401(); }
+                if actor.is_none() {
+                    return unauthorized_401();
+                }
                 let sub3 = parts.get(3).copied().unwrap_or("");
                 let sub4 = parts.get(4).copied().unwrap_or("");
                 let aname = actor_name.unwrap_or("");
-                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, &url, req).await
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, &url, req)
+                    .await
             }
 
             // -- Pull requests --
             (Method::Get, "pulls") => {
                 let sub = parts.get(3).copied().unwrap_or("");
-                match sub {
-                    "" => issues_web::page_pulls_list(&self.sql, owner, repo_name, &url, actor_name),
-                    "new" => {
-                        if actor.is_none() { return unauthorized_401(); }
-                        issues_web::page_new_pull(&self.sql, owner, repo_name, &url, actor_name)
+                if sub == "new" && actor.is_none() {
+                    return unauthorized_401();
+                }
+                let pull_number = if sub.is_empty() || sub == "new" {
+                    None
+                } else {
+                    match sub.parse::<i64>() {
+                        Ok(num) => Some(num),
+                        Err(_) => return Response::error("Not Found", 404),
                     }
-                    n => match n.parse::<i64>() {
-                        Ok(num) => issues_web::page_issue_detail(&self.sql, owner, repo_name, num, actor_name),
-                        Err(_) => Response::error("Not Found", 404),
+                };
+
+                let selection = match negotiate_or_response(
+                    &req,
+                    &[Representation::Html, Representation::Markdown],
+                    Representation::Html,
+                ) {
+                    Ok(selection) => selection,
+                    Err(resp) => return resp,
+                };
+
+                match selection.representation() {
+                    Representation::Html => match (sub, pull_number) {
+                        ("", _) => finalize_negotiated(
+                            issues_web::page_pulls_list(
+                                &self.sql, owner, repo_name, &url, actor_name,
+                            ),
+                            &selection,
+                        ),
+                        ("new", _) => finalize_negotiated(
+                            issues_web::page_new_pull(
+                                &self.sql, owner, repo_name, &url, actor_name,
+                            ),
+                            &selection,
+                        ),
+                        (_, Some(num)) => finalize_negotiated(
+                            issues_web::page_issue_detail(
+                                &self.sql, owner, repo_name, num, actor_name,
+                            ),
+                            &selection,
+                        ),
+                        _ => Response::error("Not Found", 404),
                     },
+                    Representation::Markdown => match (sub, pull_number) {
+                        ("", _) => finalize_negotiated(
+                            issues_web::page_pulls_list_markdown(
+                                &self.sql, owner, repo_name, &url, actor_name, &selection,
+                            ),
+                            &selection,
+                        ),
+                        ("new", _) => finalize_negotiated(
+                            issues_web::page_new_pull_markdown(
+                                &self.sql, owner, repo_name, &url, actor_name, &selection,
+                            ),
+                            &selection,
+                        ),
+                        (_, Some(num)) => finalize_negotiated(
+                            issues_web::page_issue_detail_markdown(
+                                &self.sql, owner, repo_name, num, actor_name, &selection,
+                            ),
+                            &selection,
+                        ),
+                        _ => Response::error("Not Found", 404),
+                    },
+                    Representation::Json => unreachable!(),
                 }
             }
             (Method::Post, "pulls") => {
-                if actor.is_none() { return unauthorized_401(); }
+                if actor.is_none() {
+                    return unauthorized_401();
+                }
                 let sub3 = parts.get(3).copied().unwrap_or("");
                 let sub4 = parts.get(4).copied().unwrap_or("");
                 let aname = actor_name.unwrap_or("");
-                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, &url, req).await
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, &url, req)
+                    .await
             }
 
             // -- Admin endpoints (owner only) --
@@ -329,8 +673,14 @@ impl DurableObject for Repository {
                 let sub = parts.get(3).unwrap_or(&"");
                 match *sub {
                     "set-ref" => {
-                        let name = url.query_pairs().find(|(k, _)| k == "name").map(|(_, v)| v.to_string());
-                        let hash = url.query_pairs().find(|(k, _)| k == "hash").map(|(_, v)| v.to_string());
+                        let name = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "name")
+                            .map(|(_, v)| v.to_string());
+                        let hash = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "hash")
+                            .map(|(_, v)| v.to_string());
                         match (name, hash) {
                             (Some(n), Some(h)) => {
                                 self.sql.exec(
@@ -348,8 +698,14 @@ impl DurableObject for Repository {
                         }
                     }
                     "config" => {
-                        let key = url.query_pairs().find(|(k, _)| k == "key").map(|(_, v)| v.to_string());
-                        let value = url.query_pairs().find(|(k, _)| k == "value").map(|(_, v)| v.to_string());
+                        let key = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "key")
+                            .map(|(_, v)| v.to_string());
+                        let value = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "value")
+                            .map(|(_, v)| v.to_string());
                         match (key, value) {
                             (Some(k), Some(v)) => {
                                 store::set_config(&self.sql, &k, &v)?;
@@ -366,11 +722,16 @@ impl DurableObject for Repository {
                         let default_ref = store::get_config(&self.sql, "default_branch")?
                             .unwrap_or_else(|| "refs/heads/main".to_string());
                         #[derive(serde::Deserialize)]
-                        struct RefRow { commit_hash: String }
-                        let rows: Vec<RefRow> = self.sql.exec(
-                            "SELECT commit_hash FROM refs WHERE name = ?",
-                            vec![SqlStorageValue::from(default_ref)],
-                        )?.to_array()?;
+                        struct RefRow {
+                            commit_hash: String,
+                        }
+                        let rows: Vec<RefRow> = self
+                            .sql
+                            .exec(
+                                "SELECT commit_hash FROM refs WHERE name = ?",
+                                vec![SqlStorageValue::from(default_ref)],
+                            )?
+                            .to_array()?;
                         if let Some(row) = rows.first() {
                             store::rebuild_fts_index(&self.sql, &row.commit_hash)?;
                             Response::ok("fts rebuilt")
@@ -423,10 +784,13 @@ impl DurableObject for Repository {
                             None,
                         )?;
                         #[derive(serde::Deserialize)]
-                        struct Count { n: i64 }
-                        let rows: Vec<Count> = self.sql.exec(
-                            "SELECT COUNT(*) AS n FROM fts_commits", None
-                        )?.to_array()?;
+                        struct Count {
+                            n: i64,
+                        }
+                        let rows: Vec<Count> = self
+                            .sql
+                            .exec("SELECT COUNT(*) AS n FROM fts_commits", None)?
+                            .to_array()?;
                         let n = rows.first().map(|r| r.n).unwrap_or(0);
                         Response::ok(format!("fts_commits rebuilt ({} entries)", n))
                     }
@@ -449,11 +813,11 @@ impl Repository {
         &self,
         owner: &str,
         repo_name: &str,
-        sub3: &str,          // "" | "new" | "<number>"
-        sub4: &str,          // "" | "comment" | "close" | "reopen" | "merge"
-        kind_url: &str,      // "issues" | "pulls"
-        actor_name: &str,    // already validated non-empty by caller
-        req_url: &Url,       // for building absolute redirect URLs
+        sub3: &str,       // "" | "new" | "<number>"
+        sub4: &str,       // "" | "comment" | "close" | "reopen" | "merge"
+        kind_url: &str,   // "issues" | "pulls"
+        actor_name: &str, // already validated non-empty by caller
+        req_url: &Url,    // for building absolute redirect URLs
         mut req: Request,
     ) -> Result<Response> {
         let kind = if kind_url == "pulls" { "pr" } else { "issue" };
@@ -462,7 +826,10 @@ impl Repository {
         if sub3.is_empty() {
             let body = req.text().await?;
             let form = issues::parse_form(&body);
-            let title = form.get("title").map(|s| s.trim().to_string()).unwrap_or_default();
+            let title = form
+                .get("title")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
             let body_text = form.get("body").cloned().unwrap_or_default();
 
             if title.is_empty() {
@@ -484,9 +851,15 @@ impl Repository {
                     None => return Response::error("source branch not found", 404),
                 };
                 let number = issues::create_issue(
-                    &self.sql, kind, &title, &body_text,
-                    actor_name, actor_name,
-                    Some(&source), Some(&target), source_hash.as_deref(),
+                    &self.sql,
+                    kind,
+                    &title,
+                    &body_text,
+                    actor_name,
+                    actor_name,
+                    Some(&source),
+                    Some(&target),
+                    source_hash.as_deref(),
                 )?;
                 return make_redirect(
                     req_url,
@@ -494,9 +867,7 @@ impl Repository {
                 );
             } else {
                 let number = issues::create_issue(
-                    &self.sql, kind, &title, &body_text,
-                    actor_name, actor_name,
-                    None, None, None,
+                    &self.sql, kind, &title, &body_text, actor_name, actor_name, None, None, None,
                 )?;
                 return make_redirect(
                     req_url,
@@ -518,20 +889,13 @@ impl Repository {
                 let comment_body = form.get("body").cloned().unwrap_or_default();
                 let issue = issues::get_issue(&self.sql, number)?
                     .ok_or_else(|| Error::RustError("not found".into()))?;
-                issues::create_comment(
-                    &self.sql, issue.id, &comment_body,
-                    actor_name, actor_name,
-                )?;
+                issues::create_comment(&self.sql, issue.id, &comment_body, actor_name, actor_name)?;
             }
             "close" => {
-                issues::set_issue_state(
-                    &self.sql, number, "closed", actor_name, owner,
-                )?;
+                issues::set_issue_state(&self.sql, number, "closed", actor_name, owner)?;
             }
             "reopen" => {
-                issues::set_issue_state(
-                    &self.sql, number, "open", actor_name, owner,
-                )?;
+                issues::set_issue_state(&self.sql, number, "open", actor_name, owner)?;
             }
             "merge" => {
                 // Only repo owner can merge
@@ -563,9 +927,7 @@ impl Repository {
     ) -> Result<Response> {
         let settings_path = format!("/{}/{}/settings", owner, repo_name);
 
-        let back = || -> Result<Response> {
-            make_redirect(req_url, &settings_path)
-        };
+        let back = || -> Result<Response> { make_redirect(req_url, &settings_path) };
 
         match action {
             "rebuild-graph" => {
@@ -592,7 +954,9 @@ impl Repository {
                         ),
                         None,
                     )?;
-                    if result.rows_written() == 0 { break; }
+                    if result.rows_written() == 0 {
+                        break;
+                    }
                     level += 1;
                 }
                 back()
@@ -612,11 +976,16 @@ impl Repository {
                 let default_ref = store::get_config(&self.sql, "default_branch")?
                     .unwrap_or_else(|| "refs/heads/main".to_string());
                 #[derive(serde::Deserialize)]
-                struct RefRow { commit_hash: String }
-                let rows: Vec<RefRow> = self.sql.exec(
-                    "SELECT commit_hash FROM refs WHERE name = ?",
-                    vec![SqlStorageValue::from(default_ref)],
-                )?.to_array()?;
+                struct RefRow {
+                    commit_hash: String,
+                }
+                let rows: Vec<RefRow> = self
+                    .sql
+                    .exec(
+                        "SELECT commit_hash FROM refs WHERE name = ?",
+                        vec![SqlStorageValue::from(default_ref)],
+                    )?
+                    .to_array()?;
                 if let Some(row) = rows.first() {
                     store::rebuild_fts_index(&self.sql, &row.commit_hash)?;
                 }
@@ -652,9 +1021,7 @@ impl Repository {
                         if kv.next() == Some("confirm") {
                             kv.next().map(|v| {
                                 // minimal URL decode for / (%2F) and spaces
-                                v.replace('+', " ")
-                                 .replace("%2F", "/")
-                                 .replace("%2f", "/")
+                                v.replace('+', " ").replace("%2F", "/").replace("%2f", "/")
                             })
                         } else {
                             None
@@ -743,10 +1110,8 @@ impl Repository {
         body.extend_from_slice(b"0000"); // flush
 
         let mut resp = Response::from_bytes(body)?;
-        resp.headers_mut()
-            .set("Content-Type", &content_type)?;
-        resp.headers_mut()
-            .set("Cache-Control", "no-cache")?;
+        resp.headers_mut().set("Content-Type", &content_type)?;
+        resp.headers_mut().set("Cache-Control", "no-cache")?;
         Ok(resp)
     }
 }

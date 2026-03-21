@@ -17,3 +17,4 @@ xpatch = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sha1_smol = "1"
 similar = "2"
+pulldown-cmark = "0.12"

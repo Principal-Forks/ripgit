@@ -15,6 +15,7 @@ struct HomeReadme {
 
 enum HomePageState {
     Populated {
+        commit_hash: String,
         entries: Vec<HomeTreeEntry>,
         recent_commits: Vec<CommitListItem>,
         readme: Option<HomeReadme>,
@@ -124,6 +125,7 @@ fn build_home_page(
             let recent_commits = summarize_commits(walk_commits(sql, &hash, 5, 0)?);
             let readme = load_root_readme(sql, &tree_hash)?;
             HomePageState::Populated {
+                commit_hash: hash,
                 entries,
                 recent_commits,
                 readme,
@@ -175,9 +177,10 @@ fn render_home_branch_selector(page: &HomePage) -> String {
     html
 }
 
-fn render_home_html(page: &HomePage, actor_name: Option<&str>) -> String {
+fn render_home_html(page: &HomePage, actor_name: Option<&str>, sql: &SqlStorage) -> String {
     let content = match &page.state {
         HomePageState::Populated {
+            commit_hash,
             entries,
             recent_commits,
             readme,
@@ -215,7 +218,7 @@ fn render_home_html(page: &HomePage, actor_name: Option<&str>) -> String {
             ));
 
             if let Some(readme) = readme {
-                html.push_str(&render_home_readme_html(page, readme));
+                html.push_str(&render_home_readme_html(sql, page, commit_hash, readme));
             }
 
             html
@@ -260,6 +263,7 @@ fn render_home_markdown(page: &HomePage, selection: &NegotiatedRepresentation) -
 
     match &page.state {
         HomePageState::Populated {
+            commit_hash: _,
             entries,
             recent_commits,
             readme,
@@ -408,7 +412,12 @@ fn load_root_readme(sql: &SqlStorage, tree_hash: &str) -> Result<Option<HomeRead
     }))
 }
 
-fn render_home_readme_html(page: &HomePage, readme: &HomeReadme) -> String {
+fn render_home_readme_html(
+    sql: &SqlStorage,
+    page: &HomePage,
+    commit_hash: &str,
+    readme: &HomeReadme,
+) -> String {
     let mut html = String::new();
     html.push_str(r#"<div class="readme-box">"#);
     html.push_str(&format!(
@@ -419,7 +428,15 @@ fn render_home_readme_html(page: &HomePage, readme: &HomeReadme) -> String {
     html.push_str(r#"<div class="readme-body">"#);
 
     if readme.is_markdown {
-        html.push_str(&render_markdown(&readme.content));
+        html.push_str(&render_repo_markdown(
+            sql,
+            &readme.content,
+            &page.owner,
+            &page.repo_name,
+            &page.ref_name,
+            commit_hash,
+            &readme.path,
+        ));
     } else {
         html.push_str(&format!("<pre>{}</pre>", html_escape(&readme.content)));
     }
@@ -449,7 +466,7 @@ pub fn page_home(
     actor_name: Option<&str>,
 ) -> Result<Response> {
     let page = build_home_page(sql, owner, repo_name, url, actor_name)?;
-    html_response(&render_home_html(&page, actor_name))
+    html_response(&render_home_html(&page, actor_name, sql))
 }
 
 pub fn page_home_markdown(

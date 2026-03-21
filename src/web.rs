@@ -9,6 +9,7 @@ use crate::{
     presentation::{self, Action, Hint, NegotiatedRepresentation},
     store,
 };
+use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
 use worker::*;
 
 mod commit;
@@ -1455,166 +1456,346 @@ fn load_branches(sql: &SqlStorage) -> Result<Vec<String>> {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown renderer (minimal, covers typical READMEs)
+// Markdown renderer
 // ---------------------------------------------------------------------------
 
 pub(crate) fn render_markdown(text: &str) -> String {
-    let mut html = String::new();
-    let mut in_code_block = false;
-    let mut in_list = false;
+    render_markdown_with_context(text, None)
+}
 
-    for line in text.lines() {
-        // Code block fences
-        if line.starts_with("```") {
-            if in_code_block {
-                html.push_str("</code></pre>\n");
-                in_code_block = false;
+pub(crate) fn render_repo_markdown(
+    sql: &SqlStorage,
+    text: &str,
+    owner: &str,
+    repo_name: &str,
+    ref_name: &str,
+    commit_hash: &str,
+    source_path: &str,
+) -> String {
+    let context = RepoMarkdownContext {
+        sql,
+        owner,
+        repo_name,
+        ref_name,
+        commit_hash,
+        source_path,
+    };
+    render_markdown_with_context(text, Some(&context))
+}
+
+struct RepoMarkdownContext<'a> {
+    sql: &'a SqlStorage,
+    owner: &'a str,
+    repo_name: &'a str,
+    ref_name: &'a str,
+    commit_hash: &'a str,
+    source_path: &'a str,
+}
+
+enum RepoMarkdownTargetKind {
+    Tree,
+    Blob,
+}
+
+fn render_markdown_with_context(text: &str, context: Option<&RepoMarkdownContext<'_>>) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_SMART_PUNCTUATION);
+
+    let parser =
+        Parser::new_ext(text, options).map(|event| sanitize_markdown_event(event, context));
+    let mut output = String::new();
+    html::push_html(&mut output, parser);
+    output
+}
+
+fn sanitize_markdown_event<'a>(
+    event: Event<'a>,
+    context: Option<&RepoMarkdownContext<'_>>,
+) -> Event<'a> {
+    match event {
+        Event::Start(tag) => Event::Start(sanitize_markdown_tag(tag, context)),
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        _ => event,
+    }
+}
+
+fn sanitize_markdown_tag<'a>(tag: Tag<'a>, context: Option<&RepoMarkdownContext<'_>>) -> Tag<'a> {
+    match tag {
+        Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        } => Tag::Link {
+            link_type,
+            dest_url: sanitize_markdown_url(rewrite_repo_markdown_url(dest_url, false, context)),
+            title,
+            id,
+        },
+        Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        } => Tag::Image {
+            link_type,
+            dest_url: sanitize_markdown_url(rewrite_repo_markdown_url(dest_url, true, context)),
+            title,
+            id,
+        },
+        _ => tag,
+    }
+}
+
+fn rewrite_repo_markdown_url<'a>(
+    url: CowStr<'a>,
+    is_image: bool,
+    context: Option<&RepoMarkdownContext<'_>>,
+) -> CowStr<'a> {
+    let Some(context) = context else {
+        return url;
+    };
+
+    let raw = url.as_ref().trim();
+    if !is_repo_relative_markdown_url(raw) {
+        return url;
+    }
+
+    let (path_part, suffix) = split_markdown_destination(raw);
+    let normalized = normalize_repo_relative_path(context.source_path, path_part);
+
+    if normalized.is_empty() {
+        return CowStr::from(format!(
+            "/{}/{}/?ref={}{}",
+            context.owner, context.repo_name, context.ref_name, suffix
+        ));
+    }
+
+    let base = if is_image {
+        format!(
+            "/{}/{}/raw/{}/{}",
+            context.owner, context.repo_name, context.ref_name, normalized
+        )
+    } else {
+        match repo_markdown_target_kind(context.sql, context.commit_hash, &normalized) {
+            Ok(Some(RepoMarkdownTargetKind::Tree)) => format!(
+                "/{}/{}/tree/{}/{}",
+                context.owner, context.repo_name, context.ref_name, normalized
+            ),
+            Ok(Some(RepoMarkdownTargetKind::Blob)) | Ok(None) | Err(_) => format!(
+                "/{}/{}/blob/{}/{}",
+                context.owner, context.repo_name, context.ref_name, normalized
+            ),
+        }
+    };
+
+    CowStr::from(format!("{}{}", base, suffix))
+}
+
+fn is_repo_relative_markdown_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('?')
+    {
+        return false;
+    }
+
+    let Some((scheme, _)) = trimmed.split_once(':') else {
+        return true;
+    };
+
+    !scheme
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn split_markdown_destination(url: &str) -> (&str, &str) {
+    for (idx, ch) in url.char_indices() {
+        if matches!(ch, '?' | '#') {
+            return (&url[..idx], &url[idx..]);
+        }
+    }
+    (url, "")
+}
+
+fn normalize_repo_relative_path(source_path: &str, target: &str) -> String {
+    let base_dir = source_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+    let mut segments: Vec<&str> = if target.starts_with('/') || base_dir.is_empty() {
+        Vec::new()
+    } else {
+        base_dir
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect()
+    };
+
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+
+    segments.join("/")
+}
+
+fn repo_markdown_target_kind(
+    sql: &SqlStorage,
+    commit_hash: &str,
+    path: &str,
+) -> Result<Option<RepoMarkdownTargetKind>> {
+    if path.is_empty() {
+        return Ok(Some(RepoMarkdownTargetKind::Tree));
+    }
+
+    let mut current_tree = load_tree_for_commit(sql, commit_hash)?;
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let Some((hash, mode)) = find_tree_entry(sql, &current_tree, segment)? else {
+            return Ok(None);
+        };
+        let is_last = idx == segments.len() - 1;
+
+        if is_last {
+            return Ok(Some(if mode == 0o040000 {
+                RepoMarkdownTargetKind::Tree
             } else {
-                if in_list {
-                    html.push_str("</ul>\n");
-                    in_list = false;
-                }
-                let code_lang = line[3..].trim();
-                let lang_cls = if code_lang.is_empty() {
-                    String::new()
-                } else {
-                    format!(" class=\"language-{}\"", html_escape(code_lang))
-                };
-                html.push_str(&format!("<pre><code{}>\n", lang_cls));
-                in_code_block = true;
-            }
-            continue;
+                RepoMarkdownTargetKind::Blob
+            }));
         }
 
-        if in_code_block {
-            html.push_str(&html_escape(line));
-            html.push('\n');
-            continue;
+        if mode != 0o040000 {
+            return Ok(None);
         }
-
-        // Headings
-        if line.starts_with("### ") {
-            close_list(&mut html, &mut in_list);
-            html.push_str(&format!("<h3>{}</h3>\n", inline_md(line[4..].trim())));
-        } else if line.starts_with("## ") {
-            close_list(&mut html, &mut in_list);
-            html.push_str(&format!("<h2>{}</h2>\n", inline_md(line[3..].trim())));
-        } else if line.starts_with("# ") {
-            close_list(&mut html, &mut in_list);
-            html.push_str(&format!("<h1>{}</h1>\n", inline_md(line[2..].trim())));
-        }
-        // Horizontal rule
-        else if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
-            close_list(&mut html, &mut in_list);
-            html.push_str("<hr>\n");
-        }
-        // Unordered list
-        else if line.starts_with("- ") || line.starts_with("* ") {
-            if !in_list {
-                html.push_str("<ul>\n");
-                in_list = true;
-            }
-            html.push_str(&format!("<li>{}</li>\n", inline_md(line[2..].trim())));
-        }
-        // Blockquote
-        else if line.starts_with("> ") {
-            close_list(&mut html, &mut in_list);
-            html.push_str(&format!(
-                "<blockquote>{}</blockquote>\n",
-                inline_md(line[2..].trim())
-            ));
-        }
-        // Empty line
-        else if line.trim().is_empty() {
-            close_list(&mut html, &mut in_list);
-        }
-        // Paragraph
-        else {
-            close_list(&mut html, &mut in_list);
-            html.push_str(&format!("<p>{}</p>\n", inline_md(line)));
-        }
+        current_tree = hash;
     }
 
-    close_list(&mut html, &mut in_list);
-    if in_code_block {
-        html.push_str("</code></pre>\n");
-    }
-
-    html
+    Ok(None)
 }
 
-fn close_list(html: &mut String, in_list: &mut bool) {
-    if *in_list {
-        html.push_str("</ul>\n");
-        *in_list = false;
+fn sanitize_markdown_url(url: CowStr<'_>) -> CowStr<'_> {
+    if is_safe_markdown_url(url.as_ref()) {
+        url
+    } else {
+        CowStr::from("#")
     }
 }
 
-/// Process inline markdown: bold, italic, code, links.
-fn inline_md(text: &str) -> String {
-    let escaped = html_escape(text);
-    let mut result = String::with_capacity(escaped.len());
-    let bytes = escaped.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Inline code: `code`
-        if bytes[i] == b'`' {
-            if let Some(end) = escaped[i + 1..].find('`') {
-                result.push_str("<code>");
-                result.push_str(&escaped[i + 1..i + 1 + end]);
-                result.push_str("</code>");
-                i += end + 2;
-                continue;
-            }
-        }
-
-        // Bold: **text**
-        if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-            if let Some(end) = escaped[i + 2..].find("**") {
-                result.push_str("<strong>");
-                result.push_str(&escaped[i + 2..i + 2 + end]);
-                result.push_str("</strong>");
-                i += end + 4;
-                continue;
-            }
-        }
-
-        // Italic: *text* (single asterisk, not preceded by another *)
-        if bytes[i] == b'*' && (i == 0 || bytes[i - 1] != b'*') {
-            if let Some(end) = escaped[i + 1..].find('*') {
-                if end > 0 && (i + 1 + end + 1 >= len || bytes[i + 1 + end + 1] != b'*') {
-                    result.push_str("<em>");
-                    result.push_str(&escaped[i + 1..i + 1 + end]);
-                    result.push_str("</em>");
-                    i += end + 2;
-                    continue;
-                }
-            }
-        }
-
-        // Links: [text](url) — operates on escaped text, so ( is literal
-        if bytes[i] == b'[' {
-            if let Some(close_bracket) = escaped[i + 1..].find(']') {
-                let after = i + 1 + close_bracket + 1;
-                if after < len && bytes[after] == b'(' {
-                    if let Some(close_paren) = escaped[after + 1..].find(')') {
-                        let link_text = &escaped[i + 1..i + 1 + close_bracket];
-                        let url = &escaped[after + 1..after + 1 + close_paren];
-                        result.push_str(&format!("<a href=\"{}\">{}</a>", url, link_text));
-                        i = after + 1 + close_paren + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        result.push(bytes[i] as char);
-        i += 1;
+fn is_safe_markdown_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return true;
     }
 
-    result
+    if trimmed.starts_with('#')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('?')
+    {
+        return true;
+    }
+
+    let Some((scheme, _)) = trimmed.split_once(':') else {
+        return true;
+    };
+
+    if !scheme
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        return true;
+    }
+
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "mailto"
+    )
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::{
+        is_repo_relative_markdown_url, normalize_repo_relative_path, render_markdown,
+        split_markdown_destination,
+    };
+
+    #[test]
+    fn render_markdown_preserves_unicode() {
+        let html = render_markdown("café 😅 — 你好");
+
+        assert!(html.contains("café 😅 — 你好"));
+    }
+
+    #[test]
+    fn render_markdown_supports_common_gfm_features() {
+        let html = render_markdown(
+            "| a | b |\n| - | - |\n| 1 | 2 |\n\n- [x] done\n- [ ] todo\n\n```rust\nfn main() {}\n```",
+        );
+
+        assert!(html.contains("<table>"));
+        assert!(html.contains("checkbox"));
+        assert!(html.contains("language-rust"));
+    }
+
+    #[test]
+    fn render_markdown_escapes_raw_html_and_unsafe_links() {
+        let html = render_markdown("<script>alert(1)</script>\n\n[bad](javascript:alert(1))");
+
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("href=\"#\""));
+        assert!(!html.contains("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_resolves_dot_segments() {
+        assert_eq!(
+            normalize_repo_relative_path("docs/README.md", "../images/logo.png"),
+            "images/logo.png"
+        );
+        assert_eq!(
+            normalize_repo_relative_path("README.md", "./guides/setup.md"),
+            "guides/setup.md"
+        );
+    }
+
+    #[test]
+    fn split_markdown_destination_preserves_query_and_fragment() {
+        assert_eq!(
+            split_markdown_destination("docs/setup.md?view=1#intro"),
+            ("docs/setup.md", "?view=1#intro")
+        );
+        assert_eq!(
+            split_markdown_destination("docs/setup.md"),
+            ("docs/setup.md", "")
+        );
+    }
+
+    #[test]
+    fn relative_url_detection_ignores_absolute_targets() {
+        assert!(is_repo_relative_markdown_url("docs/setup.md"));
+        assert!(!is_repo_relative_markdown_url("https://example.com"));
+        assert!(!is_repo_relative_markdown_url("mailto:test@example.com"));
+        assert!(!is_repo_relative_markdown_url("#usage"));
+        assert!(!is_repo_relative_markdown_url("/docs/setup.md"));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ git push origin main
 
 - **Standard git remote** — `git push`, `git clone`, `git fetch` with any git client
 - **Auth via Service Binding** — sits behind an auth worker; public read, owner-only write. GitHub OAuth example in `examples/github-oauth/`
+- **Agent-first UI** — browsable pages also negotiate `text/markdown` and `text/plain`, with explicit actions and curl-friendly paths
 - **Web UI** — file browser, commit history, diffs, code search, syntax highlighting, branch selector, markdown README, repo settings
 - **Full-text search** — FTS5 over file content and commit messages. Supports `@author:`, `@message:`, `@path:`, `@ext:`, `@content:` query prefixes
 - **Raw file serving** — `/:owner/:repo/raw/:ref/*path`
@@ -53,6 +54,21 @@ All endpoints under `/:owner/:repo/`.
 | `GET /compare/base...head` | Two-commit comparison |
 | `GET /stats` | Compression and storage stats |
 
+## Text Mode For Agents
+
+Browsable pages support negotiated text mode for curl, scripts, and agents.
+
+```bash
+curl -H 'Accept: text/markdown' https://your-worker.workers.dev/alice/repo/
+curl -H 'Accept: text/plain' https://your-worker.workers.dev/alice/repo/commits
+curl 'https://your-worker.workers.dev/alice/repo/tree/main/src?format=md'
+```
+
+- `Accept: text/markdown` returns a markdown view
+- `Accept: text/plain` returns the same content as plain text
+- `?format=md` or `?format=text` works when you can't keep headers attached while following links
+- Text pages list bare GET paths under headings like `Files (GET paths)` and spell out POST actions, fields, and requirements in an `Actions` section
+
 ## Authentication
 
 ripgit reads identity from trusted `X-Ripgit-Actor-*` headers, which are only settable by an upstream auth worker via Service Binding (not from the public internet).
@@ -62,7 +78,9 @@ ripgit reads identity from trusted `X-Ripgit-Actor-*` headers, which are only se
 
 ### GitHub OAuth example
 
-`examples/github-oauth/` is a TypeScript Cloudflare Worker that authenticates with GitHub, issues session cookies for browsers and long-lived tokens for agents/scripts, and forwards requests to ripgit via Service Binding.
+`examples/github-oauth/` is a TypeScript Cloudflare Worker that authenticates with GitHub, issues session cookies for browsers and long-lived tokens for agents/scripts, and forwards requests to ripgit via Service Binding. Its landing page and `/settings` also support the same text-mode negotiation for curl-driven agents.
+
+See `examples/github-oauth/README.md` for a focused deploy/setup guide.
 
 **Local dev:**
 

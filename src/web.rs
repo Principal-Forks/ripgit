@@ -79,23 +79,25 @@ pub(crate) fn layout(
     <a href="/" class="logo">ripgit</a>
     <div class="global-auth">{global_auth}</div>
   </div>
-  <div class="repo-bar">
-    <div class="repo-crumb">
-      <a href="/{owner}/" class="owner-name">{owner}</a>
-      <span class="sep">/</span>
-      <a href="/{owner}/{repo_name}/" class="repo-name">{repo_name}</a>
+  <div class="repo-bar-wrap">
+    <div class="repo-bar">
+      <div class="repo-crumb">
+        <a href="/{owner}/" class="owner-name">{owner}</a>
+        <span class="sep">/</span>
+        <a href="/{owner}/{repo_name}/" class="repo-name">{repo_name}</a>
+      </div>
+      <div class="repo-search">
+        <input type="text" id="nav-search-input" placeholder="Search..." autocomplete="off" spellcheck="false">
+        <div id="nav-search-results" class="nav-search-results" hidden></div>
+      </div>
+      <nav class="repo-tabs">
+        <a href="/{owner}/{repo_name}/">Code</a>
+        <a href="/{owner}/{repo_name}/commits">Commits</a>
+        <a href="/{owner}/{repo_name}/issues">Issues</a>
+        <a href="/{owner}/{repo_name}/pulls">PRs</a>
+        {repo_settings_link}
+      </nav>
     </div>
-    <div class="repo-search">
-      <input type="text" id="nav-search-input" placeholder="Search..." autocomplete="off" spellcheck="false">
-      <div id="nav-search-results" class="nav-search-results" hidden></div>
-    </div>
-    <nav class="repo-tabs">
-      <a href="/{owner}/{repo_name}/">Code</a>
-      <a href="/{owner}/{repo_name}/commits">Commits</a>
-      <a href="/{owner}/{repo_name}/issues">Issues</a>
-      <a href="/{owner}/{repo_name}/pulls">PRs</a>
-      {repo_settings_link}
-    </nav>
   </div>
 </header>
 <main>
@@ -207,8 +209,6 @@ a:hover { text-decoration: underline; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  max-width: 1200px;
-  margin: 0 auto;
   padding: 0 24px;
   height: 44px;
 }
@@ -217,6 +217,10 @@ header { border-bottom: 1px solid #d1d9e0; }
 .global-auth { display: flex; align-items: center; gap: 10px; font-size: 13px; }
 
 /* ── Repo bar (context + actions) ───────────────────────────── */
+.repo-bar-wrap {
+  border-top: 1px solid #d1d9e0;
+  background: #f6f8fa;
+}
 .repo-bar {
   display: flex;
   align-items: center;
@@ -225,8 +229,6 @@ header { border-bottom: 1px solid #d1d9e0; }
   margin: 0 auto;
   padding: 0 24px;
   height: 40px;
-  border-top: 1px solid #d1d9e0;
-  background: #f6f8fa;
 }
 .repo-crumb { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .repo-search { flex: 0 0 auto; }

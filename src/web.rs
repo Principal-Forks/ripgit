@@ -13,7 +13,7 @@ type Url = worker::Url;
 // Layout: shared HTML shell
 // ---------------------------------------------------------------------------
 
-fn layout(
+pub(crate) fn layout(
     title: &str,
     owner: &str,
     repo_name: &str,
@@ -73,6 +73,8 @@ fn layout(
     <nav class="repo-tabs">
       <a href="/{owner}/{repo_name}/">Code</a>
       <a href="/{owner}/{repo_name}/commits">Commits</a>
+      <a href="/{owner}/{repo_name}/issues">Issues</a>
+      <a href="/{owner}/{repo_name}/pulls">PRs</a>
       {repo_settings_link}
     </nav>
   </div>
@@ -620,6 +622,76 @@ h2 { font-size: 16px; margin-bottom: 12px; }
   text-decoration: none;
 }
 .nsr-all:hover { background: #eef1f5; text-decoration: none; }
+
+/* ── Issues & PRs ───────────────────────────────────────────── */
+.issue-list-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.issue-tabs { display: flex; gap: 0; border: 1px solid #d1d9e0; border-radius: 6px; overflow: hidden; margin-bottom: 0; }
+.issue-tab { padding: 6px 16px; font-size: 13px; color: #656d76; background: #f6f8fa; border-right: 1px solid #d1d9e0; text-decoration: none; }
+.issue-tab:last-child { border-right: none; }
+.issue-tab.active { background: #fff; color: #1f2328; font-weight: 600; }
+.issue-tab:hover { background: #eaeef2; text-decoration: none; }
+.issue-list { border: 1px solid #d1d9e0; border-radius: 6px; overflow: hidden; margin-top: 8px; }
+.issue-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 16px; border-bottom: 1px solid #d1d9e0; }
+.issue-item:last-child { border-bottom: none; }
+.issue-item:hover { background: #f6f8fa; }
+.issue-state-icon { font-size: 14px; margin-top: 2px; flex-shrink: 0; }
+.issue-state-icon.open { color: #1a7f37; }
+.issue-state-icon.closed { color: #656d76; }
+.issue-state-icon.merged { color: #8250df; }
+.issue-item-main { flex: 1; min-width: 0; }
+.issue-item-title { font-weight: 600; color: #1f2328; word-break: break-word; }
+.issue-item-title:hover { color: #0969da; text-decoration: none; }
+.issue-item-meta { font-size: 12px; color: #656d76; margin-top: 2px; }
+.pr-branch-pair { font-size: 12px; color: #656d76; margin-left: 8px; }
+.pr-branch-pair code { font-size: 12px; background: #f6f8fa; padding: 1px 5px; border-radius: 3px; border: 1px solid #d1d9e0; }
+.issue-empty { padding: 24px; color: #656d76; text-align: center; }
+.issue-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+.issue-badge.open { background: #dafbe1; color: #1a7f37; }
+.issue-badge.closed { background: #f0f2f4; color: #656d76; }
+.issue-badge.merged { background: #eee4ff; color: #8250df; }
+.issue-detail-header { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #d1d9e0; }
+.issue-title-row h1 { font-size: 22px; margin-bottom: 8px; }
+.issue-number-heading { color: #656d76; font-weight: 400; }
+.issue-meta-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.issue-meta-text { font-size: 13px; color: #656d76; }
+.issue-body-wrap { border: 1px solid #d1d9e0; border-radius: 6px; padding: 16px 20px; margin-bottom: 20px; }
+.issue-body { line-height: 1.6; }
+.issue-no-description { color: #656d76; font-style: italic; font-size: 14px; }
+.comment { border: 1px solid #d1d9e0; border-radius: 6px; margin-bottom: 12px; overflow: hidden; }
+.comment-header { display: flex; align-items: center; gap: 8px; padding: 8px 14px; background: #f6f8fa; border-bottom: 1px solid #d1d9e0; font-size: 13px; }
+.comment-time { color: #656d76; font-size: 12px; }
+.comment-body { padding: 12px 16px; font-size: 14px; line-height: 1.6; }
+.comment-form-wrap { border: 1px solid #d1d9e0; border-radius: 6px; margin-top: 16px; overflow: hidden; }
+.comment-header-row { padding: 8px 14px; background: #f6f8fa; border-bottom: 1px solid #d1d9e0; font-size: 13px; font-weight: 600; }
+.comment-form { padding: 12px 16px; }
+.comment-textarea { width: 100%; padding: 8px 12px; border: 1px solid #d1d9e0; border-radius: 6px; font-size: 14px; font-family: inherit; resize: vertical; }
+.comment-textarea:focus { outline: none; border-color: #0969da; box-shadow: 0 0 0 3px rgba(9,105,218,0.1); }
+.comment-form-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.comment-thread { margin: 16px 0; }
+.pr-diff-section { margin: 20px 0; }
+.pr-diff-section h2 { font-size: 16px; margin-bottom: 10px; }
+.pr-diff-stats { display: flex; gap: 12px; align-items: center; padding: 8px 14px; background: #f6f8fa; border: 1px solid #d1d9e0; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+.pr-merge-box { padding: 16px; background: #dafbe1; border: 1px solid #aef0be; border-radius: 6px; margin-bottom: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.pr-merged-box { padding: 12px 16px; background: #eee4ff; border: 1px solid #d8b4fe; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
+.pr-merge-hint { font-size: 12px; color: #1a7f37; margin: 0; }
+.pr-branch-info { display: flex; align-items: center; gap: 8px; }
+.branch-tag { background: #f6f8fa; border: 1px solid #d1d9e0; padding: 2px 8px; border-radius: 4px; font-size: 13px; }
+.pr-branch-missing { color: #cf222e; font-size: 14px; }
+.btn-primary { padding: 6px 16px; background: #2da44e; color: #fff; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-block; }
+.btn-primary:hover { background: #2c974b; color: #fff; text-decoration: none; }
+.btn-merge { padding: 8px 20px; background: #8250df; color: #fff; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; font-weight: 600; }
+.btn-merge:hover { background: #6e40c9; }
+.new-issue-form { max-width: 760px; }
+.form-group { margin-bottom: 16px; }
+.form-label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.form-hint { font-weight: 400; color: #656d76; }
+.form-input { width: 100%; padding: 8px 12px; border: 1px solid #d1d9e0; border-radius: 6px; font-size: 14px; font-family: inherit; }
+.form-input:focus { outline: none; border-color: #0969da; box-shadow: 0 0 0 3px rgba(9,105,218,0.1); }
+.form-textarea { width: 100%; padding: 8px 12px; border: 1px solid #d1d9e0; border-radius: 6px; font-size: 14px; font-family: inherit; resize: vertical; }
+.form-textarea:focus { outline: none; border-color: #0969da; box-shadow: 0 0 0 3px rgba(9,105,218,0.1); }
+.form-actions { display: flex; gap: 8px; align-items: center; }
+.form-branch-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.form-branch-row .arrow { font-size: 18px; color: #656d76; padding-bottom: 6px; }
 "#;
 
 // ---------------------------------------------------------------------------
@@ -1535,7 +1607,7 @@ pub fn page_search(
 // Diff rendering
 // ---------------------------------------------------------------------------
 
-fn render_file_diff(file: &diff::FileDiff) -> String {
+pub(crate) fn render_file_diff(file: &diff::FileDiff) -> String {
     let status_class = match file.status {
         diff::DiffStatus::Added => "added",
         diff::DiffStatus::Deleted => "deleted",
@@ -2021,7 +2093,7 @@ fn load_commit_meta_opt(sql: &SqlStorage, hash: &str) -> Result<Option<CommitMet
     }))
 }
 
-fn resolve_default_branch(sql: &SqlStorage) -> Result<(String, Option<String>)> {
+pub(crate) fn resolve_default_branch(sql: &SqlStorage) -> Result<(String, Option<String>)> {
     // Try main first, then the first ref we find
     if let Some(hash) = api::resolve_ref(sql, "main")? {
         return Ok(("main".to_string(), Some(hash)));
@@ -2135,7 +2207,7 @@ fn render_branch_selector(
 // Markdown renderer (minimal, covers typical READMEs)
 // ---------------------------------------------------------------------------
 
-fn render_markdown(text: &str) -> String {
+pub(crate) fn render_markdown(text: &str) -> String {
     let mut html = String::new();
     let mut in_code_block = false;
     let mut in_list = false;
@@ -2298,14 +2370,14 @@ fn inline_md(text: &str) -> String {
 // Utility functions
 // ---------------------------------------------------------------------------
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
-fn html_response(body: &str) -> Result<Response> {
+pub(crate) fn html_response(body: &str) -> Result<Response> {
     let mut resp = Response::from_html(body)?;
     resp.headers_mut().set("Cache-Control", "no-cache")?;
     Ok(resp)
@@ -2329,7 +2401,7 @@ fn parent_path(path: &str) -> String {
     }
 }
 
-fn format_time(unix: i64) -> String {
+pub(crate) fn format_time(unix: i64) -> String {
     // Simple relative time
     let now = js_sys_date_now() / 1000.0;
     let diff = (now as i64) - unix;

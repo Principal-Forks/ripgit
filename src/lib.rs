@@ -1,6 +1,8 @@
 mod api;
 mod diff;
 mod git;
+mod issues;
+mod issues_web;
 mod pack;
 mod schema;
 mod store;
@@ -43,6 +45,17 @@ fn unauthorized_401() -> Result<Response> {
     resp.headers_mut()
         .set("WWW-Authenticate", r#"Basic realm="ripgit""#)?;
     Ok(resp)
+}
+
+/// Build a 302 redirect using an absolute URL.
+///
+/// `Response::error("", 302)` + manual Location header is unreliable on some
+/// Cloudflare Workers runtimes ("unrecognized JavaScript object"). Using
+/// `Response::redirect()` with a proper absolute URL avoids this.
+fn make_redirect(base_url: &Url, path: &str) -> Result<Response> {
+    let abs = format!("{}{}", base_url.origin().ascii_serialization(), path);
+    let url = Url::parse(&abs).map_err(|e| Error::RustError(e.to_string()))?;
+    Response::redirect(url)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +263,7 @@ impl DurableObject for Repository {
                     return resp;
                 }
                 let sub = parts.get(3).copied().unwrap_or("");
-                self.handle_settings_action(owner, repo_name, sub, req).await
+                self.handle_settings_action(owner, repo_name, sub, &url, req).await
             }
             (Method::Get, "raw") => {
                 let ref_name = parts.get(3).unwrap_or(&"main");
@@ -260,6 +273,52 @@ impl DurableObject for Repository {
                     String::new()
                 };
                 web::serve_raw(&self.sql, ref_name, &sub_path)
+            }
+
+            // -- Issues --
+            (Method::Get, "issues") => {
+                let sub = parts.get(3).copied().unwrap_or("");
+                match sub {
+                    "" => issues_web::page_issues_list(&self.sql, owner, repo_name, &url, actor_name),
+                    "new" => {
+                        if actor.is_none() { return unauthorized_401(); }
+                        issues_web::page_new_issue(&self.sql, owner, repo_name, actor_name)
+                    }
+                    n => match n.parse::<i64>() {
+                        Ok(num) => issues_web::page_issue_detail(&self.sql, owner, repo_name, num, actor_name),
+                        Err(_) => Response::error("Not Found", 404),
+                    },
+                }
+            }
+            (Method::Post, "issues") => {
+                if actor.is_none() { return unauthorized_401(); }
+                let sub3 = parts.get(3).copied().unwrap_or("");
+                let sub4 = parts.get(4).copied().unwrap_or("");
+                let aname = actor_name.unwrap_or("");
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "issues", aname, &url, req).await
+            }
+
+            // -- Pull requests --
+            (Method::Get, "pulls") => {
+                let sub = parts.get(3).copied().unwrap_or("");
+                match sub {
+                    "" => issues_web::page_pulls_list(&self.sql, owner, repo_name, &url, actor_name),
+                    "new" => {
+                        if actor.is_none() { return unauthorized_401(); }
+                        issues_web::page_new_pull(&self.sql, owner, repo_name, &url, actor_name)
+                    }
+                    n => match n.parse::<i64>() {
+                        Ok(num) => issues_web::page_issue_detail(&self.sql, owner, repo_name, num, actor_name),
+                        Err(_) => Response::error("Not Found", 404),
+                    },
+                }
+            }
+            (Method::Post, "pulls") => {
+                if actor.is_none() { return unauthorized_401(); }
+                let sub3 = parts.get(3).copied().unwrap_or("");
+                let sub4 = parts.get(4).copied().unwrap_or("");
+                let aname = actor_name.unwrap_or("");
+                self.handle_issue_action(owner, repo_name, sub3, sub4, "pulls", aname, &url, req).await
             }
 
             // -- Admin endpoints (owner only) --
@@ -385,21 +444,127 @@ impl DurableObject for Repository {
 // ---------------------------------------------------------------------------
 
 impl Repository {
+    /// Handle POST /:owner/:repo/{issues,pulls}/:sub3/:sub4
+    async fn handle_issue_action(
+        &self,
+        owner: &str,
+        repo_name: &str,
+        sub3: &str,          // "" | "new" | "<number>"
+        sub4: &str,          // "" | "comment" | "close" | "reopen" | "merge"
+        kind_url: &str,      // "issues" | "pulls"
+        actor_name: &str,    // already validated non-empty by caller
+        req_url: &Url,       // for building absolute redirect URLs
+        mut req: Request,
+    ) -> Result<Response> {
+        let kind = if kind_url == "pulls" { "pr" } else { "issue" };
+
+        // POST /{issues|pulls}  →  create
+        if sub3.is_empty() {
+            let body = req.text().await?;
+            let form = issues::parse_form(&body);
+            let title = form.get("title").map(|s| s.trim().to_string()).unwrap_or_default();
+            let body_text = form.get("body").cloned().unwrap_or_default();
+
+            if title.is_empty() {
+                return Response::error("title is required", 400);
+            }
+
+            if kind == "pr" {
+                let source = form.get("source").cloned().unwrap_or_default();
+                let target = form.get("target").cloned().unwrap_or_default();
+                if source.is_empty() || target.is_empty() {
+                    return Response::error("source and target branches are required", 400);
+                }
+                if source == target {
+                    return Response::error("source and target branches must differ", 400);
+                }
+                let source_ref = format!("refs/heads/{}", source);
+                let source_hash = match api::resolve_ref(&self.sql, &source_ref)? {
+                    Some(h) => Some(h),
+                    None => return Response::error("source branch not found", 404),
+                };
+                let number = issues::create_issue(
+                    &self.sql, kind, &title, &body_text,
+                    actor_name, actor_name,
+                    Some(&source), Some(&target), source_hash.as_deref(),
+                )?;
+                return make_redirect(
+                    req_url,
+                    &format!("/{}/{}/{}/{}", owner, repo_name, kind_url, number),
+                );
+            } else {
+                let number = issues::create_issue(
+                    &self.sql, kind, &title, &body_text,
+                    actor_name, actor_name,
+                    None, None, None,
+                )?;
+                return make_redirect(
+                    req_url,
+                    &format!("/{}/{}/{}/{}", owner, repo_name, kind_url, number),
+                );
+            }
+        }
+
+        // POST /{issues|pulls}/:n/...
+        let number: i64 = match sub3.parse() {
+            Ok(n) => n,
+            Err(_) => return Response::error("Not Found", 404),
+        };
+
+        match sub4 {
+            "comment" => {
+                let body = req.text().await?;
+                let form = issues::parse_form(&body);
+                let comment_body = form.get("body").cloned().unwrap_or_default();
+                let issue = issues::get_issue(&self.sql, number)?
+                    .ok_or_else(|| Error::RustError("not found".into()))?;
+                issues::create_comment(
+                    &self.sql, issue.id, &comment_body,
+                    actor_name, actor_name,
+                )?;
+            }
+            "close" => {
+                issues::set_issue_state(
+                    &self.sql, number, "closed", actor_name, owner,
+                )?;
+            }
+            "reopen" => {
+                issues::set_issue_state(
+                    &self.sql, number, "open", actor_name, owner,
+                )?;
+            }
+            "merge" => {
+                // Only repo owner can merge
+                if actor_name != owner {
+                    return Response::error("Forbidden: only the repo owner can merge", 403);
+                }
+                match issues::merge_pr(&self.sql, number, actor_name) {
+                    Ok(_) => {}
+                    Err(e) => return Response::error(&e.to_string(), 409),
+                }
+            }
+            _ => return Response::error("Not Found", 404),
+        }
+
+        make_redirect(
+            req_url,
+            &format!("/{}/{}/{}/{}", owner, repo_name, kind_url, number),
+        )
+    }
+
     /// Handle POST /:owner/:repo/settings/:action — all owner-only mutations.
     async fn handle_settings_action(
         &self,
         owner: &str,
         repo_name: &str,
         action: &str,
+        req_url: &Url,
         mut req: Request,
     ) -> Result<Response> {
-        let settings_url = format!("/{}/{}/settings", owner, repo_name);
+        let settings_path = format!("/{}/{}/settings", owner, repo_name);
 
-        // Helper: redirect back to settings (relative URL via Location header)
         let back = || -> Result<Response> {
-            let mut r = Response::error("", 302)?;
-            r.headers_mut().set("Location", &settings_url)?;
-            Ok(r)
+            make_redirect(req_url, &settings_path)
         };
 
         match action {
@@ -500,10 +665,7 @@ impl Repository {
                 let expected = format!("{}/{}", owner, repo_name);
                 if confirm_val.trim() == expected {
                     self.state.storage().delete_all().await?;
-                    // Redirect to owner profile after deletion
-                    let mut r = Response::error("", 302)?;
-                    r.headers_mut().set("Location", &format!("/{}/", owner))?;
-                    Ok(r)
+                    make_redirect(req_url, &format!("/{}/", owner))
                 } else {
                     // Wrong confirmation — bounce back to settings
                     back()

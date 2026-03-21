@@ -177,4 +177,59 @@ pub fn init(sql: &SqlStorage) {
         None,
     )
     .expect("create fts_commits");
+
+    // -- Issues and pull requests --
+
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS issues (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            number            INTEGER NOT NULL,
+            kind              TEXT NOT NULL DEFAULT 'issue',
+            title             TEXT NOT NULL,
+            body              TEXT NOT NULL DEFAULT '',
+            author_id         TEXT NOT NULL,
+            author_name       TEXT NOT NULL,
+            state             TEXT NOT NULL DEFAULT 'open',
+            source_branch     TEXT,
+            target_branch     TEXT,
+            source_hash       TEXT,
+            merge_commit_hash TEXT,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL
+        )",
+        None,
+    )
+    .expect("create issues");
+
+    sql.exec(
+        "CREATE TABLE IF NOT EXISTS issue_comments (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id    INTEGER NOT NULL,
+            author_id   TEXT NOT NULL,
+            author_name TEXT NOT NULL,
+            body        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        )",
+        None,
+    )
+    .expect("create issue_comments");
+
+    sql.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_number ON issues(number)",
+        None,
+    )
+    .expect("create idx_issues_number");
+
+    sql.exec(
+        "CREATE INDEX IF NOT EXISTS idx_issues_kind_state ON issues(kind, state)",
+        None,
+    )
+    .expect("create idx_issues_kind_state");
+
+    sql.exec(
+        "CREATE INDEX IF NOT EXISTS idx_issue_comments_issue ON issue_comments(issue_id)",
+        None,
+    )
+    .expect("create idx_issue_comments_issue");
 }

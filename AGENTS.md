@@ -11,7 +11,8 @@ A self-hosted git server running on Cloudflare Durable Objects. Each repository 
 ```
 src/
   lib.rs        Worker entry point. Routes /:owner/:repo/* to DO, /:owner/ to profile page.
-                Also contains Actor/auth helpers, check_write_access, list_repos (KV query).
+                Also contains Actor/auth helpers, check_write_access, list_repos (KV query),
+                handle_issue_action (issue/PR POST handler).
   pack.rs       Git pack file parser (two-pass: index + resolve). ResolveCache (Arc-based,
                 budget-limited). Pack generator for upload-pack.
   git.rs        Smart HTTP protocol handlers: receive-pack (push) and upload-pack (fetch/clone).
@@ -21,7 +22,13 @@ src/
   api.rs        Read-only JSON API endpoints. parse_search_query() handles @prefix: syntax.
   diff.rs       Recursive tree diff, line-level unified diffs (similar crate), commit comparison.
   web.rs        Server-rendered HTML for all 9 web pages. layout() is the shared shell.
+                Key helpers are pub(crate): layout(), html_escape(), html_response(),
+                format_time(), render_markdown(), resolve_default_branch(), render_file_diff().
   schema.rs     Schema initialisation (runs in DO::new). All CREATE TABLE/INDEX statements.
+  issues.rs     Issues and PR storage + merge logic. CRUD functions, three-way tree merge,
+                BFS merge-base finder, git object serialization (SHA-1 via sha1_smol),
+                parse_form() URL-decode utility.
+  issues_web.rs Server-rendered HTML pages for issues and PRs. Uses web::layout() and helpers.
 
 examples/github-oauth/
   src/index.ts  Auth worker: GitHub OAuth flow, session cookies, agent tokens, forwards to
@@ -85,7 +92,26 @@ Commits are stored both:
 
 ### Commit graph (binary lifting)
 
-`commit_graph` table enables O(log N) ancestor lookups. Level 0 = direct first-parent. Level k = ancestor at distance 2^k. Used for merge-base calculations (future PR merge) and push validation. Rebuilt via `PUT /:owner/:repo/settings/rebuild-graph` or `PUT /:owner/:repo/admin/rebuild-graph`.
+`commit_graph` table enables O(log N) ancestor lookups. Level 0 = direct first-parent. Level k = ancestor at distance 2^k. Used for push validation. Rebuilt via `PUT /:owner/:repo/settings/rebuild-graph` or `PUT /:owner/:repo/admin/rebuild-graph`.
+
+### Issues and pull requests
+
+`issues` table (unified): `id`, `number` (sequential per-repo), `kind` (`"issue"` or `"pr"`), `title`, `body`, `author_id`, `author_name`, `state` (`"open"` / `"closed"` / `"merged"`), `source_branch`, `target_branch`, `source_hash`, `merge_commit_hash`, timestamps.
+
+`issue_comments` table: `id`, `issue_id`, `author_id`, `author_name`, `body`, timestamps.
+
+**Auth**: any authenticated user can create issues/PRs and comment. Only the issue/PR author or repo owner can close/reopen. Only the repo owner can merge PRs.
+
+**Merge commit algorithm** (`issues::merge_pr`):
+1. BFS merge-base finder (`find_merge_base`) — walks `commit_parents` from both branch HEADs
+2. `flatten_tree` — recursively reads `trees` table into a flat `HashMap<path, (mode, blob_hash)>`
+3. `merge_three_way` — three-way file-level merge; returns conflict error listing paths if any file diverged in both branches
+4. `build_tree_from_files` — builds new tree objects bottom-up; calls `store::store_tree` which also writes to `raw_objects`
+5. `serialize_commit_content` + `git_sha1("commit", ...)` — creates merge commit bytes and SHA-1
+6. `store::store_commit(..., bulk_mode=false)` — persists commit, updates `commit_graph` and `fts_commits`
+7. Updates `refs` and sets `issues.state = "merged"` + `merge_commit_hash`
+
+Fast-forward case (target is ancestor of source): merged tree = source tree directly, no three-way merge needed.
 
 ### FTS5
 
@@ -108,6 +134,8 @@ Symbol-heavy queries (containing `.`, `_`, `(`, `:`) bypass FTS5 and use `INSTR`
 - Git protocol: `info/refs`, `git-receive-pack`, `git-upload-pack`
 - JSON API: `refs`, `file`, `search`, `stats`, `log`, `commit`, `tree`, `blob`, `diff`, `compare`
 - Web UI: `""` (home), `commits`, `log` (alias), `tree`, `blob`, `raw`, `search-ui`, `settings`
+- Issues: `GET issues` (list), `GET issues/new`, `GET issues/:n`, `POST issues` (create), `POST issues/:n/comment`, `POST issues/:n/close`, `POST issues/:n/reopen`
+- PRs: `GET pulls` (list), `GET pulls/new`, `GET pulls/:n`, `POST pulls` (create), `POST pulls/:n/comment`, `POST pulls/:n/close`, `POST pulls/:n/reopen`, `POST pulls/:n/merge` (owner only)
 - Admin: `PUT admin/...` — set-ref, config, rebuild-fts, rebuild-graph, rebuild-fts-commits
 - Settings actions: `POST settings/rebuild-graph`, `settings/rebuild-fts`, etc.
 
@@ -117,7 +145,7 @@ Symbol-heavy queries (containing `.`, `_`, `(`, `:`) bypass FTS5 and use `INSTR`
 
 **Two-row header:**
 - Row 1 (`.global-nav`): ripgit logo left, username + sign out right
-- Row 2 (`.repo-bar`): owner/repo breadcrumb, search input, then Code/Commits/Settings tabs right-anchored
+- Row 2 (`.repo-bar`): owner/repo breadcrumb, search input, then Code/Commits/Issues/PRs/Settings tabs right-anchored
 
 **Content negotiation** in the DO handler: `wants_html` is checked for routes that can return either HTML or JSON (log, commit, tree/blob by hash, diff). HTML-only routes (`""`, `commits`, `tree/:ref/`, `blob/:ref/`, `search-ui`, `settings`, `raw`) don't check it.
 
@@ -141,8 +169,10 @@ Ok(resp)
 ## Known gotchas / past mistakes
 
 - **`SQLITE_AUTH`** — raw `PRAGMA` SQL is blocked. Use `sql.database_size()` for DB size. Never use `pragma_page_count()` or `pragma_page_size()` as table-valued functions.
+- **`SqlStorageValue::Null`** — DO SQLite's Rust bindings throw "unrecognized JavaScript object" when passing `SqlStorageValue::Null` as a query parameter. Store empty strings `""` for absent optional text fields and map back to `None` on read via a `nonempty()` helper. NULL *in result sets* (from columns with no DEFAULT) deserializes fine into `Option<String>` — the issue is parameter binding only.
+- **`Response::error("", 302)` is unreliable** — creates an "unrecognized JavaScript object" error on some Cloudflare runtimes. Use `make_redirect(req_url, path)` which constructs an absolute URL and calls `Response::redirect(url)` instead. See `lib.rs`.
 - **Agent `actorName` vs owner name** — the token display name is not the owner's username. Always store and forward `ownerActorName` for agent tokens in the auth worker.
-- **`Response::redirect` relative URLs** — doesn't work. Always use the `Response::error("", 302)` + `Location` header pattern for relative redirects in Rust workers.
+- **`Response::redirect` relative URLs** — `Url::parse("/path")` fails because relative URLs can't be parsed standalone. Always construct an absolute URL from the request origin: `format!("{}{}", req_url.origin().ascii_serialization(), path)`.
 - **`url.pathname` percent-encoding** — Cloudflare Workers preserves `%3A` in pathnames rather than decoding to `:`. Always `decodeURIComponent()` path segments before using them as KV keys.
 - **DO name stability** — once a repo is pushed, the DO name is `{owner}/{repo}` forever. Never add rename logic that would change the DO name — it would create a new empty DO and orphan the old one.
 

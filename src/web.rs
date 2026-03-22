@@ -563,6 +563,7 @@ h2 { font-size: 16px; margin-bottom: 12px; }
 }
 .readme-body pre code { background: none; padding: 0; }
 .readme-body a { color: #0969da; }
+.readme-body img { max-width: 100%; }
 .readme-body hr { border: none; border-top: 1px solid #d1d9e0; margin: 16px 0; }
 .readme-body blockquote {
   border-left: 3px solid #d1d9e0;

@@ -316,6 +316,44 @@ describe("git CLI e2e", () => {
     );
   });
 
+  test("rejects oversize pushes as git protocol status, not handler failure", async () => {
+    const owner = uniqueId("owner");
+    const repo = uniqueId("repo");
+    const remotePath = `/${owner}/${repo}`;
+    const requestBody = Buffer.concat([
+      buildReceivePackRequest(
+        "0000000000000000000000000000000000000000",
+        "1111111111111111111111111111111111111111",
+        "refs/heads/main",
+        ["report-status", "side-band-64k", "quiet"],
+      ),
+      Buffer.allocUnsafe(50_000_001),
+    ]);
+
+    const response = await server.dispatch(`${remotePath}/git-receive-pack`, {
+      method: "POST",
+      headers: {
+        ...actorHeaders(owner),
+        "Content-Type": "application/x-git-receive-pack-request",
+      },
+      body: requestBody,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/x-git-receive-pack-result");
+
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const first = readPktLine(bytes, 0);
+    expect(first.payload[0]).toBe(1);
+
+    const status = textDecoder.decode(first.payload.slice(1));
+    expect(status).toContain("unpack pack too large");
+    expect(status).toContain("ng refs/heads/main pack too large");
+
+    const flush = readPktLine(bytes, first.nextOffset);
+    expect(flush.payload).toBeNull();
+  });
+
   test("includes receive-pack progress and honors quiet", async () => {
     const owner = uniqueId("owner");
     const loudRepo = uniqueId("repo");

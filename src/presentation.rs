@@ -650,3 +650,108 @@ fn add_vary_accept(resp: &mut Response) -> Result<()> {
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_format_parses_supported_aliases() {
+        let html = parse_query_format(" HTML ").expect("html format");
+        assert_eq!(html.representation(), Representation::Html);
+        assert_eq!(html.query_format_value(), "html");
+        assert_eq!(html.response_content_type(), "text/html; charset=utf-8");
+        assert!(!html.vary_accept());
+
+        let markdown = parse_query_format("markdown").expect("markdown format");
+        assert_eq!(markdown.representation(), Representation::Markdown);
+        assert_eq!(markdown.query_format_value(), "md");
+        assert_eq!(
+            markdown.response_content_type(),
+            "text/markdown; charset=utf-8"
+        );
+
+        let plain = parse_query_format("text").expect("plain text format");
+        assert_eq!(plain.representation(), Representation::Markdown);
+        assert_eq!(plain.query_format_value(), "text");
+        assert_eq!(plain.response_content_type(), "text/plain; charset=utf-8");
+
+        assert!(parse_query_format("yaml").is_none());
+    }
+
+    #[test]
+    fn parse_accept_reads_quality_values_and_invalid_entries() {
+        let tokens =
+            parse_accept("text/plain; q=0.5, application/json;q=1, text/html;q=bogus, */*;q=0");
+
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0].media_type, "text/plain");
+        assert_eq!(tokens[0].q, 500);
+        assert_eq!(tokens[1].media_type, "application/json");
+        assert_eq!(tokens[1].q, 1000);
+        assert_eq!(tokens[2].media_type, "text/html");
+        assert_eq!(tokens[2].q, 0);
+        assert_eq!(tokens[3].media_type, "*/*");
+        assert_eq!(tokens[3].q, 0);
+    }
+
+    #[test]
+    fn best_accept_match_prefers_plain_text_markdown_when_exactly_requested() {
+        let tokens = parse_accept("text/*;q=0.7, text/plain;q=0.7");
+        let selection = best_accept_match(
+            &tokens,
+            &[Representation::Html, Representation::Markdown],
+            Representation::Html,
+        )
+        .expect("selection");
+
+        assert_eq!(selection.representation(), Representation::Markdown);
+        assert_eq!(
+            selection.response_content_type(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(selection.preferred_accept_value(), "text/plain");
+        assert!(selection.vary_accept());
+    }
+
+    #[test]
+    fn best_accept_match_uses_default_representation_for_wildcard_ties() {
+        let tokens = parse_accept("*/*");
+        let selection = best_accept_match(
+            &tokens,
+            &[Representation::Html, Representation::Markdown],
+            Representation::Html,
+        )
+        .expect("selection");
+
+        assert_eq!(selection.representation(), Representation::Html);
+        assert_eq!(
+            selection.response_content_type(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn best_accept_match_returns_none_when_no_supported_media_type_matches() {
+        let tokens = parse_accept("application/json");
+        let selection = best_accept_match(
+            &tokens,
+            &[Representation::Html, Representation::Markdown],
+            Representation::Html,
+        );
+
+        assert!(selection.is_none());
+    }
+
+    #[test]
+    fn append_format_value_replaces_existing_format_and_preserves_fragment() {
+        assert_eq!(
+            append_format_value("/alice/repo/tree/main/src?foo=1&format=html#L42", "md"),
+            "/alice/repo/tree/main/src?foo=1&format=md#L42"
+        );
+        assert_eq!(
+            append_format_value("/alice/repo/?ref=main", "text"),
+            "/alice/repo/?ref=main&format=text"
+        );
+    }
+}

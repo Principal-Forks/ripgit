@@ -1066,13 +1066,20 @@ impl Repository {
         pkt_line(&mut body, &svc_line);
         body.extend_from_slice(b"0000"); // flush
 
-        // Build capabilities, including symref for HEAD
+        // Build capabilities, including symref for HEAD.
+        // upload-pack and receive-pack speak different capability sets.
         let default_branch = store::get_config(&self.sql, "default_branch")?
             .unwrap_or_else(|| "refs/heads/main".to_string());
-        let caps = format!(
-            "report-status delete-refs ofs-delta symref=HEAD:{}",
-            default_branch
-        );
+        let caps = match service {
+            "git-upload-pack" => format!(
+                "multi_ack_detailed no-done ofs-delta symref=HEAD:{}",
+                default_branch
+            ),
+            _ => format!(
+                "report-status delete-refs ofs-delta symref=HEAD:{}",
+                default_branch
+            ),
+        };
 
         if refs.is_empty() {
             // Empty repo: advertise zero-id with capabilities

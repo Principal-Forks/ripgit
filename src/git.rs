@@ -1,7 +1,7 @@
 //! Git smart HTTP protocol handlers for receive-pack and upload-pack.
 
 use crate::{pack, store, KEYFRAME_INTERVAL};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use worker::*;
 
 // ---------------------------------------------------------------------------
@@ -312,29 +312,49 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
 /// 4. Generate and return a pack file
 pub fn handle_upload_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // --- 1. Parse want/have negotiation ---
-    let (wants, haves) = parse_want_have(body);
+    let request = parse_upload_request(body);
 
-    if wants.is_empty() {
+    if request.wants.is_empty() {
         return Err(Error::RustError("no want lines received".into()));
     }
 
-    let have_set: HashSet<String> = haves.into_iter().collect();
+    let have_set: HashSet<String> = request.haves.iter().cloned().collect();
+    let common_haves = find_common_haves(sql, &request.wants, &request.haves)?;
+
+    let can_send_pack_without_done = !request.done
+        && request.capabilities.contains("multi_ack_detailed")
+        && request.capabilities.contains("no-done")
+        && !common_haves.is_empty();
+
+    if !request.done && !request.haves.is_empty() && !can_send_pack_without_done {
+        let mut resp = Response::from_bytes(build_negotiation_response(&request, &common_haves))?;
+        resp.headers_mut()
+            .set("Content-Type", "application/x-git-upload-pack-result")?;
+        return Ok(resp);
+    }
 
     // --- 2-3. Collect all needed objects (commits, trees, blobs) ---
-    let objects = store::collect_objects(sql, &wants, &have_set)?;
+    let objects = store::collect_objects(sql, &request.wants, &have_set)?;
 
     // --- 4. Generate pack file ---
     let pack_data = pack::generate(&objects);
 
-    // Build response: NAK + pack data
-    let mut resp_body = Vec::new();
-    pkt_line_bytes(&mut resp_body, b"NAK\n");
+    // Build response: pkt-line negotiation prefix, then pack data.
+    let mut resp_body = build_pack_response_prefix(&request, &common_haves);
     resp_body.extend_from_slice(&pack_data);
 
     let mut resp = Response::from_bytes(resp_body)?;
     resp.headers_mut()
         .set("Content-Type", "application/x-git-upload-pack-result")?;
     Ok(resp)
+}
+
+#[derive(Debug, Default)]
+struct UploadRequest {
+    wants: Vec<String>,
+    haves: Vec<String>,
+    capabilities: HashSet<String>,
+    done: bool,
 }
 
 /// Parse want/have lines from a git-upload-pack request body.
@@ -345,10 +365,10 @@ pub fn handle_upload_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
 ///   [have <hash>\n]
 ///   ...
 ///   done\n
-fn parse_want_have(data: &[u8]) -> (Vec<String>, Vec<String>) {
-    let mut wants = Vec::new();
-    let mut haves = Vec::new();
+fn parse_upload_request(data: &[u8]) -> UploadRequest {
+    let mut request = UploadRequest::default();
     let mut pos = 0;
+    let mut saw_first_want = false;
 
     loop {
         match read_pkt_line(data, pos) {
@@ -364,17 +384,25 @@ fn parse_want_have(data: &[u8]) -> (Vec<String>, Vec<String>) {
                 };
 
                 if text == "done" {
+                    request.done = true;
                     break;
                 } else if let Some(rest) = text.strip_prefix("want ") {
                     // First want line may have capabilities after a space
-                    let hash = rest.split_whitespace().next().unwrap_or("");
+                    let mut fields = rest.split_whitespace();
+                    let hash = fields.next().unwrap_or("");
                     if hash.len() == 40 {
-                        wants.push(hash.to_string());
+                        request.wants.push(hash.to_string());
+                    }
+                    if !saw_first_want {
+                        saw_first_want = true;
+                        for capability in fields {
+                            request.capabilities.insert(capability.to_string());
+                        }
                     }
                 } else if let Some(rest) = text.strip_prefix("have ") {
                     let hash = rest.split_whitespace().next().unwrap_or("");
                     if hash.len() == 40 {
-                        haves.push(hash.to_string());
+                        request.haves.push(hash.to_string());
                     }
                 }
             }
@@ -382,7 +410,117 @@ fn parse_want_have(data: &[u8]) -> (Vec<String>, Vec<String>) {
         }
     }
 
-    (wants, haves)
+    request
+}
+
+fn find_common_haves(sql: &SqlStorage, wants: &[String], haves: &[String]) -> Result<Vec<String>> {
+    if wants.is_empty() || haves.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let want_haves: HashSet<String> = haves.iter().cloned().collect();
+    let mut found: HashSet<String> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = wants.iter().cloned().collect();
+
+    #[derive(serde::Deserialize)]
+    struct ParentRow {
+        parent_hash: String,
+    }
+
+    while let Some(commit_hash) = queue.pop_front() {
+        if !visited.insert(commit_hash.clone()) {
+            continue;
+        }
+
+        if want_haves.contains(&commit_hash) {
+            found.insert(commit_hash.clone());
+        }
+
+        let parents: Vec<ParentRow> = sql
+            .exec(
+                "SELECT parent_hash FROM commit_parents
+                 WHERE commit_hash = ? ORDER BY ordinal ASC",
+                vec![SqlStorageValue::from(commit_hash)],
+            )?
+            .to_array()?;
+
+        for parent in parents {
+            if !visited.contains(&parent.parent_hash) {
+                queue.push_back(parent.parent_hash);
+            }
+        }
+    }
+
+    Ok(haves
+        .iter()
+        .filter(|have| found.contains(*have))
+        .cloned()
+        .collect())
+}
+
+fn build_negotiation_response(request: &UploadRequest, common_haves: &[String]) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    match common_haves.last().map(|s| s.as_str()) {
+        Some(_) if request.capabilities.contains("multi_ack_detailed") => {
+            for common in common_haves {
+                pkt_line_bytes(&mut body, format!("ACK {} common\n", common).as_bytes());
+            }
+            pkt_line_bytes(&mut body, b"NAK\n");
+        }
+        Some(common) if request.capabilities.contains("multi_ack") => {
+            pkt_line_bytes(&mut body, format!("ACK {} continue\n", common).as_bytes());
+            pkt_line_bytes(&mut body, b"NAK\n");
+        }
+        Some(common) => {
+            pkt_line_bytes(&mut body, format!("ACK {}\n", common).as_bytes());
+        }
+        None => pkt_line_bytes(&mut body, b"NAK\n"),
+    }
+
+    body
+}
+
+fn build_pack_response_prefix(request: &UploadRequest, common_haves: &[String]) -> Vec<u8> {
+    let mut body = Vec::new();
+
+    if !request.done
+        && request.capabilities.contains("multi_ack_detailed")
+        && request.capabilities.contains("no-done")
+    {
+        if let Some(common) = common_haves.last().map(|s| s.as_str()) {
+            for common_have in common_haves {
+                pkt_line_bytes(
+                    &mut body,
+                    format!("ACK {} common\n", common_have).as_bytes(),
+                );
+            }
+            pkt_line_bytes(&mut body, format!("ACK {} ready\n", common).as_bytes());
+            pkt_line_bytes(&mut body, b"NAK\n");
+            pkt_line_bytes(&mut body, format!("ACK {}\n", common).as_bytes());
+            return body;
+        }
+    }
+
+    if request.done {
+        if request.capabilities.contains("multi_ack_detailed")
+            || request.capabilities.contains("multi_ack")
+        {
+            if let Some(common) = common_haves.last().map(|s| s.as_str()) {
+                pkt_line_bytes(&mut body, format!("ACK {}\n", common).as_bytes());
+                return body;
+            }
+        }
+
+        if common_haves.is_empty() {
+            pkt_line_bytes(&mut body, b"NAK\n");
+        }
+        return body;
+    }
+
+    pkt_line_bytes(&mut body, b"NAK\n");
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -503,4 +641,92 @@ fn pkt_line_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     let len = 4 + data.len();
     buf.extend_from_slice(format!("{:04x}", len).as_bytes());
     buf.extend_from_slice(data);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_upload_request_reads_caps_haves_and_done() {
+        let mut body = Vec::new();
+        pkt_line_bytes(
+            &mut body,
+            b"want 0123456789012345678901234567890123456789 multi_ack_detailed no-done ofs-delta\n",
+        );
+        body.extend_from_slice(b"0000");
+        pkt_line_bytes(
+            &mut body,
+            b"have abcdefabcdefabcdefabcdefabcdefabcdefabcd\n",
+        );
+        pkt_line_bytes(&mut body, b"done\n");
+
+        let request = parse_upload_request(&body);
+
+        assert_eq!(
+            request.wants,
+            vec!["0123456789012345678901234567890123456789"]
+        );
+        assert_eq!(
+            request.haves,
+            vec!["abcdefabcdefabcdefabcdefabcdefabcdefabcd"]
+        );
+        assert!(request.done);
+        assert!(request.capabilities.contains("multi_ack_detailed"));
+        assert!(request.capabilities.contains("no-done"));
+        assert!(request.capabilities.contains("ofs-delta"));
+    }
+
+    #[test]
+    fn pack_response_prefix_uses_ack_ready_for_no_done_fetches() {
+        let mut capabilities = HashSet::new();
+        capabilities.insert("multi_ack_detailed".to_string());
+        capabilities.insert("no-done".to_string());
+        let request = UploadRequest {
+            capabilities,
+            ..UploadRequest::default()
+        };
+
+        let common_haves = vec!["0123456789012345678901234567890123456789".to_string()];
+        let prefix = build_pack_response_prefix(&request, &common_haves);
+
+        let mut expected = Vec::new();
+        pkt_line_bytes(
+            &mut expected,
+            b"ACK 0123456789012345678901234567890123456789 common\n",
+        );
+        pkt_line_bytes(
+            &mut expected,
+            b"ACK 0123456789012345678901234567890123456789 ready\n",
+        );
+        pkt_line_bytes(&mut expected, b"NAK\n");
+        pkt_line_bytes(
+            &mut expected,
+            b"ACK 0123456789012345678901234567890123456789\n",
+        );
+        assert_eq!(prefix, expected);
+    }
+
+    #[test]
+    fn negotiation_response_acks_common_commit_before_done() {
+        let mut capabilities = HashSet::new();
+        capabilities.insert("multi_ack_detailed".to_string());
+        let request = UploadRequest {
+            capabilities,
+            ..UploadRequest::default()
+        };
+
+        let response = build_negotiation_response(
+            &request,
+            &["0123456789012345678901234567890123456789".to_string()],
+        );
+
+        let mut expected = Vec::new();
+        pkt_line_bytes(
+            &mut expected,
+            b"ACK 0123456789012345678901234567890123456789 common\n",
+        );
+        pkt_line_bytes(&mut expected, b"NAK\n");
+        assert_eq!(response, expected);
+    }
 }

@@ -638,3 +638,47 @@ pub(crate) fn resolve_ref(sql: &SqlStorage, name: &str) -> Result<Option<String>
 
     Ok(rows.into_iter().next().map(|r| r.commit_hash))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_search_query_extracts_commit_scope_and_filters() {
+        let parsed = parse_search_query("@author:steve @message:fix @path:src/ @ext:rs parser");
+
+        assert_eq!(parsed.fts_query, "author:steve message:fix parser");
+        assert_eq!(parsed.path_filter.as_deref(), Some("src/"));
+        assert_eq!(parsed.ext_filter.as_deref(), Some("rs"));
+        assert_eq!(parsed.scope, Some("commits"));
+    }
+
+    #[test]
+    fn parse_search_query_preserves_content_prefix_for_code_search() {
+        let parsed = parse_search_query("@content:TODO plain terms");
+
+        assert_eq!(parsed.fts_query, "content:TODO plain terms");
+        assert_eq!(parsed.path_filter, None);
+        assert_eq!(parsed.ext_filter, None);
+        assert_eq!(parsed.scope, None);
+    }
+
+    #[test]
+    fn parse_search_query_uses_last_path_and_extension_filter() {
+        let parsed = parse_search_query("@path:src/ @path:tests/ @ext:rs @ext:toml query");
+
+        assert_eq!(parsed.fts_query, "query");
+        assert_eq!(parsed.path_filter.as_deref(), Some("tests/"));
+        assert_eq!(parsed.ext_filter.as_deref(), Some("toml"));
+    }
+
+    #[test]
+    fn get_query_returns_first_match_and_decodes_values() {
+        let url = Url::parse("https://ripgit.local/search?q=hello%20world&q=ignored&scope=code")
+            .expect("url");
+
+        assert_eq!(get_query(&url, "q").as_deref(), Some("hello world"));
+        assert_eq!(get_query(&url, "scope").as_deref(), Some("code"));
+        assert_eq!(get_query(&url, "missing"), None);
+    }
+}

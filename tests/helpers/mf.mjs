@@ -42,11 +42,15 @@ export async function createTestServer() {
   };
 }
 
-export function ownerHeaders(owner, headers = {}) {
+export function actorHeaders(actorName, headers = {}) {
   return {
-    "X-Ripgit-Actor-Name": owner,
+    "X-Ripgit-Actor-Name": actorName,
     ...headers,
   };
+}
+
+export function ownerHeaders(owner, headers = {}) {
+  return actorHeaders(owner, headers);
 }
 
 export function uniqueId(prefix) {

@@ -11,7 +11,7 @@ import {
   makeTempDir,
   pushAsOwner,
 } from "./helpers/git.mjs";
-import { createTestServer, uniqueId } from "./helpers/mf.mjs";
+import { actorHeaders, createTestServer, uniqueId } from "./helpers/mf.mjs";
 
 let server;
 const tempDirs = [];
@@ -106,5 +106,85 @@ describe("git CLI e2e", () => {
 
     await git(firstClone.repoDir, ["fetch", "origin"]);
     expect(await gitStdout(firstClone.repoDir, ["rev-parse", "origin/main"])).toBe(forceHead);
+  });
+
+  test("fetches new branch and tag refs into an existing clone", async () => {
+    const owner = uniqueId("owner");
+    const repo = uniqueId("repo");
+    const featureBranch = uniqueId("feature");
+    const tagName = `${uniqueId("tag")}-release`;
+    const branchToken = uniqueToken("branchref");
+    const remoteUrl = new URL(`/${owner}/${repo}`, server.url).toString();
+
+    const source = await cloneFixture();
+    tempDirs.push(source.workDir);
+    await addRemote(source.repoDir, "ripgit", remoteUrl);
+    await pushAsOwner(source.repoDir, owner, "push", "ripgit", "HEAD:refs/heads/main");
+
+    const existingClone = await cloneRemote(remoteUrl);
+
+    await git(source.repoDir, ["checkout", "-b", featureBranch]);
+    const featureHead = await appendLineAndCommit(
+      source.repoDir,
+      "README.md",
+      `ripgit e2e token ${branchToken}`,
+      "e2e branch ref change",
+    );
+    await git(source.repoDir, ["tag", tagName]);
+    const tagHead = await gitStdout(source.repoDir, ["rev-parse", tagName]);
+
+    await pushAsOwner(
+      source.repoDir,
+      owner,
+      "push",
+      "ripgit",
+      `HEAD:refs/heads/${featureBranch}`,
+      `refs/tags/${tagName}:refs/tags/${tagName}`,
+    );
+
+    let response = await server.dispatch(`/${owner}/${repo}/refs`);
+    expect(response.status).toBe(200);
+    let refs = await response.json();
+    expect(refs.heads.main).toBeTypeOf("string");
+    expect(refs.heads[featureBranch]).toBe(featureHead);
+    expect(refs.tags[tagName]).toBe(tagHead);
+
+    await git(existingClone.repoDir, ["fetch", "origin", "--tags"]);
+    expect(await gitStdout(existingClone.repoDir, ["rev-parse", `refs/remotes/origin/${featureBranch}`])).toBe(featureHead);
+    expect(await gitStdout(existingClone.repoDir, ["rev-parse", `refs/tags/${tagName}`])).toBe(tagHead);
+  });
+
+  test("lists pushed repositories on the owner profile", async () => {
+    const owner = uniqueId("owner");
+    const repoOne = uniqueId("repo");
+    const repoTwo = uniqueId("repo");
+    const remoteOne = new URL(`/${owner}/${repoOne}`, server.url).toString();
+    const remoteTwo = new URL(`/${owner}/${repoTwo}`, server.url).toString();
+
+    let response = await server.dispatch(`/${owner}/?format=md`, {
+      headers: actorHeaders(owner),
+    });
+    expect(response.status).toBe(200);
+    let markdown = await response.text();
+    expect(markdown).toContain("Repositories: `0`");
+    expect(markdown).toContain("No repositories yet. Repositories are created on first push.");
+
+    const source = await cloneFixture();
+    tempDirs.push(source.workDir);
+    await addRemote(source.repoDir, "ripgit-one", remoteOne);
+    await addRemote(source.repoDir, "ripgit-two", remoteTwo);
+
+    await pushAsOwner(source.repoDir, owner, "push", "ripgit-one", "HEAD:refs/heads/main");
+    await pushAsOwner(source.repoDir, owner, "push", "ripgit-two", "HEAD:refs/heads/main");
+
+    response = await server.dispatch(`/${owner}/?format=md`, {
+      headers: actorHeaders(owner),
+    });
+    expect(response.status).toBe(200);
+    markdown = await response.text();
+    expect(markdown).toContain("Repositories: `2`");
+    expect(markdown).toContain(`- \`${repoOne}\` - \`/${owner}/${repoOne}\``);
+    expect(markdown).toContain(`- \`${repoTwo}\` - \`/${owner}/${repoTwo}\``);
+    expect(markdown).toContain("## Push a New Repository");
   });
 });

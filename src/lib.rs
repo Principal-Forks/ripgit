@@ -902,8 +902,20 @@ impl Repository {
                 if actor_name != owner {
                     return Response::error("Forbidden: only the repo owner can merge", 403);
                 }
+                let target_branch =
+                    issues::get_issue(&self.sql, number)?.and_then(|issue| issue.target_branch);
                 match issues::merge_pr(&self.sql, number, actor_name) {
-                    Ok(_) => {}
+                    Ok(merge_hash) => {
+                        if let Some(target_branch) = target_branch {
+                            if let Some(default_ref) =
+                                store::get_config(&self.sql, "default_branch")?
+                            {
+                                if default_ref == format!("refs/heads/{}", target_branch) {
+                                    let _ = store::rebuild_fts_index(&self.sql, &merge_hash);
+                                }
+                            }
+                        }
+                    }
                     Err(e) => return Response::error(&e.to_string(), 409),
                 }
             }

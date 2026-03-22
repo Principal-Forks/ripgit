@@ -154,6 +154,64 @@ describe("git CLI e2e", () => {
     expect(await gitStdout(existingClone.repoDir, ["rev-parse", `refs/tags/${tagName}`])).toBe(tagHead);
   });
 
+  test("deletes branch and tag refs and prunes them from an existing clone", async () => {
+    const owner = uniqueId("owner");
+    const repo = uniqueId("repo");
+    const featureBranch = uniqueId("feature");
+    const tagName = `${uniqueId("tag")}-delete`;
+    const remoteUrl = new URL(`/${owner}/${repo}`, server.url).toString();
+
+    const source = await cloneFixture();
+    tempDirs.push(source.workDir);
+    await addRemote(source.repoDir, "ripgit", remoteUrl);
+    await pushAsOwner(source.repoDir, owner, "push", "ripgit", "HEAD:refs/heads/main");
+
+    await git(source.repoDir, ["checkout", "-b", featureBranch]);
+    await appendLineAndCommit(
+      source.repoDir,
+      "README.md",
+      `ripgit e2e token ${uniqueToken("deleteref")}`,
+      "e2e delete ref change",
+    );
+    await git(source.repoDir, ["tag", tagName]);
+    await pushAsOwner(
+      source.repoDir,
+      owner,
+      "push",
+      "ripgit",
+      `HEAD:refs/heads/${featureBranch}`,
+      `refs/tags/${tagName}:refs/tags/${tagName}`,
+    );
+
+    const existingClone = await cloneRemote(remoteUrl);
+    await git(existingClone.repoDir, ["fetch", "origin", "--tags"]);
+    expect(
+      await gitStdout(existingClone.repoDir, ["rev-parse", `refs/remotes/origin/${featureBranch}`]),
+    ).toHaveLength(40);
+    expect(await gitStdout(existingClone.repoDir, ["rev-parse", `refs/tags/${tagName}`])).toHaveLength(40);
+
+    await pushAsOwner(
+      source.repoDir,
+      owner,
+      "push",
+      "ripgit",
+      `:refs/heads/${featureBranch}`,
+      `:refs/tags/${tagName}`,
+    );
+
+    let response = await server.dispatch(`/${owner}/${repo}/refs`);
+    expect(response.status).toBe(200);
+    let refs = await response.json();
+    expect(refs.heads[featureBranch]).toBeUndefined();
+    expect(refs.tags[tagName]).toBeUndefined();
+
+    await git(existingClone.repoDir, ["fetch", "origin", "--prune", "--prune-tags"]);
+    await expect(
+      gitStdout(existingClone.repoDir, ["rev-parse", `refs/remotes/origin/${featureBranch}`]),
+    ).rejects.toThrow();
+    await expect(gitStdout(existingClone.repoDir, ["rev-parse", `refs/tags/${tagName}`])).rejects.toThrow();
+  });
+
   test("lists pushed repositories on the owner profile", async () => {
     const owner = uniqueId("owner");
     const repoOne = uniqueId("repo");

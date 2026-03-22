@@ -26,13 +26,25 @@ use worker::*;
 /// 9. Return report-status
 pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // --- 1. Parse ref update commands from pkt-lines ---
-    let (commands, pack_offset) = parse_ref_commands(body);
+    let request = parse_receive_pack_request(body);
+    let preferred_sideband_mode = preferred_sideband_mode(&request.capabilities);
+    let sideband_mode = match requested_sideband_mode(&request.capabilities) {
+        Ok(mode) => mode,
+        Err(e) => {
+            return protocol_fatal_response(
+                "git-receive-pack",
+                &format!("receive-pack capabilities: {}", e),
+                preferred_sideband_mode,
+            )
+        }
+    };
+    let send_progress = should_send_receive_progress(&request, sideband_mode);
 
     // Git splits large pushes (>http.postBuffer) into two POSTs:
     //   1st: a 4-byte flush "0000" (no commands, no pack)
     //   2nd: the full payload (commands + flush + pack)
     // Return 200 for the probe so git proceeds with the real request.
-    if commands.is_empty() {
+    if request.commands.is_empty() {
         let mut resp = Response::from_bytes(Vec::new())?;
         resp.headers_mut()
             .set("Content-Type", "application/x-git-receive-pack-result")?;
@@ -40,83 +52,111 @@ pub fn handle_receive_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     }
 
     // --- Check bulk mode (skip_fts=1 skips commit graph + FTS indexing) ---
-    let bulk_mode = store::get_config(sql, "skip_fts")?
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let result: Result<Response> = (|| {
+        let bulk_mode = store::get_config(sql, "skip_fts")?
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
-    // --- 2-7. Process pack data (streaming) ---
-    // Note: Cloudflare DO SQLite does not support BEGIN/COMMIT via sql.exec().
-    // transactionSync() is not available in workers-rs 0.7.5.
-    // Each sql.exec() auto-commits individually. If the DO times out mid-push,
-    // partial state may result. Use the admin/set-ref endpoint to recover.
-    // TODO: look into getting transaction support in workers-rs
-    let pack_data = &body[pack_offset..];
+        // --- 2-7. Process pack data (streaming) ---
+        // Note: Cloudflare DO SQLite does not support BEGIN/COMMIT via sql.exec().
+        // transactionSync() is not available in workers-rs 0.7.5.
+        // Each sql.exec() auto-commits individually. If the DO times out mid-push,
+        // partial state may result. Use the admin/set-ref endpoint to recover.
+        // TODO: look into getting transaction support in workers-rs
+        let pack_data = &body[request.pack_offset..];
 
-    // Reject oversized packs before any object is parsed.  A clean ng response
-    // is far better than an OOM panic mid-push.  The push script already splits
-    // at 30 MB; this is a server-side safety net.
-    if pack_data.len() > pack::MAX_PACK_BYTES {
-        let reason = format!(
-            "pack too large ({} MB, limit {} MB)",
-            pack_data.len() / 1_000_000,
-            pack::MAX_PACK_BYTES / 1_000_000,
-        );
-        let mut buf = Vec::new();
-        pkt_line_bytes(&mut buf, format!("unpack ng {}\n", reason).as_bytes());
-        for cmd in &commands {
-            pkt_line_bytes(
-                &mut buf,
-                format!("ng {} {}\n", cmd.ref_name, reason).as_bytes(),
+        // Reject oversized packs before any object is parsed.  A clean ng response
+        // is far better than an OOM panic mid-push.  The push script already splits
+        // at 30 MB; this is a server-side safety net.
+        if pack_data.len() > pack::MAX_PACK_BYTES {
+            let reason = format!(
+                "pack too large ({} MB, limit {} MB)",
+                pack_data.len() / 1_000_000,
+                pack::MAX_PACK_BYTES / 1_000_000,
+            );
+            let status_body = build_unpack_error_status(&request.commands, &reason);
+            let progress = if send_progress {
+                receive_pack_progress_messages(
+                    &request,
+                    pack_data.len(),
+                    0,
+                    request.commands.len(),
+                    false,
+                )
+            } else {
+                Vec::new()
+            };
+            return protocol_result_response(
+                "git-receive-pack",
+                maybe_sideband_wrap_with_progress(status_body, &progress, sideband_mode),
             );
         }
-        buf.extend_from_slice(b"0000");
-        let mut resp = Response::from_bytes(buf)?;
-        resp.headers_mut()
-            .set("Content-Type", "application/x-git-receive-pack-result")?;
-        return Ok(resp);
-    }
 
-    if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
-        process_pack_streaming(sql, pack_data, bulk_mode)?;
-    }
+        if pack_data.len() > 4 && &pack_data[..4] == b"PACK" {
+            process_pack_streaming(sql, pack_data, bulk_mode)?;
+        }
 
-    // --- 8. Update refs ---
-    let mut results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
+        // --- 8. Update refs ---
+        let mut results: Vec<(String, std::result::Result<(), String>)> = Vec::new();
 
-    for cmd in &commands {
-        let result = store::update_ref(sql, &cmd.ref_name, &cmd.old_hash, &cmd.new_hash)
-            .map_err(|e| format!("{}", e));
-        results.push((cmd.ref_name.clone(), result));
-    }
+        for cmd in &request.commands {
+            let result = store::update_ref(sql, &cmd.ref_name, &cmd.old_hash, &cmd.new_hash)
+                .map_err(|e| format!("{}", e));
+            results.push((cmd.ref_name.clone(), result));
+        }
 
-    // --- Set default branch + rebuild FTS index ---
-    for (ref_name, result) in &results {
-        if result.is_ok() && ref_name.starts_with("refs/heads/") {
-            if store::get_config(sql, "default_branch")?.is_none() {
-                let _ = store::set_config(sql, "default_branch", ref_name);
+        // --- Set default branch + rebuild FTS index ---
+        for (ref_name, result) in &results {
+            if result.is_ok() && ref_name.starts_with("refs/heads/") {
+                if store::get_config(sql, "default_branch")?.is_none() {
+                    let _ = store::set_config(sql, "default_branch", ref_name);
+                }
             }
         }
-    }
 
-    if !bulk_mode {
-        if let Some(default_ref) = store::get_config(sql, "default_branch")? {
-            for cmd in &commands {
-                if cmd.ref_name == default_ref {
-                    if let Some((_, Ok(()))) = results.iter().find(|(r, _)| r == &cmd.ref_name) {
-                        let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+        let mut rebuilt_default_branch_fts = false;
+        if !bulk_mode {
+            if let Some(default_ref) = store::get_config(sql, "default_branch")? {
+                for cmd in &request.commands {
+                    if cmd.ref_name == default_ref {
+                        if let Some((_, Ok(()))) = results.iter().find(|(r, _)| r == &cmd.ref_name)
+                        {
+                            let _ = store::rebuild_fts_index(sql, &cmd.new_hash);
+                            rebuilt_default_branch_fts = true;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // --- 9. Return report-status ---
-    let status_body = build_report_status(&results);
+        // --- 9. Return report-status ---
+        let status_body = build_report_status(&results);
+        let ok_count = results.iter().filter(|(_, result)| result.is_ok()).count();
+        let progress = if send_progress {
+            receive_pack_progress_messages(
+                &request,
+                pack_data.len(),
+                ok_count,
+                results.len().saturating_sub(ok_count),
+                rebuilt_default_branch_fts,
+            )
+        } else {
+            Vec::new()
+        };
 
-    let mut resp = Response::from_bytes(status_body)?;
-    resp.headers_mut()
-        .set("Content-Type", "application/x-git-receive-pack-result")?;
-    Ok(resp)
+        protocol_result_response(
+            "git-receive-pack",
+            maybe_sideband_wrap_with_progress(status_body, &progress, sideband_mode),
+        )
+    })();
+
+    result.or_else(|err| {
+        protocol_fatal_response(
+            "git-receive-pack",
+            &protocol_error_message(&err),
+            sideband_mode,
+        )
+    })
 }
 
 /// Process pack data using the streaming two-pass approach.
@@ -313,40 +353,69 @@ fn process_pack_streaming(sql: &SqlStorage, pack_data: &[u8], bulk_mode: bool) -
 pub fn handle_upload_pack(sql: &SqlStorage, body: &[u8]) -> Result<Response> {
     // --- 1. Parse want/have negotiation ---
     let request = parse_upload_request(body);
+    let preferred_sideband_mode = preferred_sideband_mode(&request.capabilities);
+    let sideband_mode = match requested_sideband_mode(&request.capabilities) {
+        Ok(mode) => mode,
+        Err(e) => {
+            return protocol_fatal_response(
+                "git-upload-pack",
+                &format!("upload-pack capabilities: {}", e),
+                preferred_sideband_mode,
+            )
+        }
+    };
+    let send_progress = should_send_upload_progress(&request, sideband_mode);
 
-    if request.wants.is_empty() {
-        return Err(Error::RustError("no want lines received".into()));
-    }
+    let result: Result<Response> = (|| {
+        if request.wants.is_empty() {
+            return Err(Error::RustError("no want lines received".into()));
+        }
 
-    let have_set: HashSet<String> = request.haves.iter().cloned().collect();
-    let common_haves = find_common_haves(sql, &request.wants, &request.haves)?;
+        let have_set: HashSet<String> = request.haves.iter().cloned().collect();
+        let common_haves = find_common_haves(sql, &request.wants, &request.haves)?;
 
-    let can_send_pack_without_done = !request.done
-        && request.capabilities.contains("multi_ack_detailed")
-        && request.capabilities.contains("no-done")
-        && !common_haves.is_empty();
+        let can_send_pack_without_done = !request.done
+            && request.capabilities.contains("multi_ack_detailed")
+            && request.capabilities.contains("no-done")
+            && !common_haves.is_empty();
 
-    if !request.done && !request.haves.is_empty() && !can_send_pack_without_done {
-        let mut resp = Response::from_bytes(build_negotiation_response(&request, &common_haves))?;
-        resp.headers_mut()
-            .set("Content-Type", "application/x-git-upload-pack-result")?;
-        return Ok(resp);
-    }
+        if !request.done && !request.haves.is_empty() && !can_send_pack_without_done {
+            return protocol_result_response(
+                "git-upload-pack",
+                build_negotiation_response(&request, &common_haves),
+            );
+        }
 
-    // --- 2-3. Collect all needed objects (commits, trees, blobs) ---
-    let objects = store::collect_objects(sql, &request.wants, &have_set)?;
+        // --- 2-3. Collect all needed objects (commits, trees, blobs) ---
+        let objects = store::collect_objects(sql, &request.wants, &have_set)?;
 
-    // --- 4. Generate pack file ---
-    let pack_data = pack::generate(&objects);
+        // Build response: pkt-line negotiation prefix, then pack data.
+        let mut resp_body = build_pack_response_prefix(&request, &common_haves);
+        match sideband_mode {
+            Some(mode) => {
+                if send_progress {
+                    for message in upload_pack_progress_messages(objects.len()) {
+                        append_sideband_data(&mut resp_body, 2, message.as_bytes(), mode);
+                    }
+                }
+                pack::generate_into(&objects, |chunk| {
+                    append_sideband_data(&mut resp_body, 1, chunk, mode)
+                });
+                resp_body.extend_from_slice(b"0000");
+            }
+            None => pack::generate_into(&objects, |chunk| resp_body.extend_from_slice(chunk)),
+        }
 
-    // Build response: pkt-line negotiation prefix, then pack data.
-    let mut resp_body = build_pack_response_prefix(&request, &common_haves);
-    resp_body.extend_from_slice(&pack_data);
+        protocol_result_response("git-upload-pack", resp_body)
+    })();
 
-    let mut resp = Response::from_bytes(resp_body)?;
-    resp.headers_mut()
-        .set("Content-Type", "application/x-git-upload-pack-result")?;
-    Ok(resp)
+    result.or_else(|err| {
+        protocol_fatal_response(
+            "git-upload-pack",
+            &protocol_error_message(&err),
+            sideband_mode,
+        )
+    })
 }
 
 #[derive(Debug, Default)]
@@ -533,11 +602,36 @@ struct RefCommand {
     ref_name: String,
 }
 
+#[derive(Default)]
+struct ReceivePackRequest {
+    commands: Vec<RefCommand>,
+    pack_offset: usize,
+    capabilities: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebandMode {
+    Small,
+    Large,
+}
+
+impl SidebandMode {
+    fn max_data_len(self) -> usize {
+        match self {
+            // 4-byte pkt-line length + 1 sideband code + 995 bytes data = 1000 total.
+            Self::Small => 995,
+            // 4-byte pkt-line length + 1 sideband code + 65515 bytes data = 65520 total.
+            Self::Large => 65_515,
+        }
+    }
+}
+
 /// Parse pkt-line encoded ref update commands from the start of the body.
 /// Returns the commands and the byte offset where the pack data begins.
-fn parse_ref_commands(data: &[u8]) -> (Vec<RefCommand>, usize) {
-    let mut commands = Vec::new();
+fn parse_receive_pack_request(data: &[u8]) -> ReceivePackRequest {
+    let mut request = ReceivePackRequest::default();
     let mut pos = 0;
+    let mut first_command = true;
 
     loop {
         match read_pkt_line(data, pos) {
@@ -548,15 +642,20 @@ fn parse_ref_commands(data: &[u8]) -> (Vec<RefCommand>, usize) {
             }
             Some((Some(line), new_pos)) => {
                 pos = new_pos;
-                if let Some(cmd) = parse_single_command(line) {
-                    commands.push(cmd);
+                if let Some((cmd, capabilities)) = parse_single_command(line) {
+                    if first_command {
+                        request.capabilities = capabilities;
+                        first_command = false;
+                    }
+                    request.commands.push(cmd);
                 }
             }
             None => break, // end of data
         }
     }
 
-    (commands, pos)
+    request.pack_offset = pos;
+    request
 }
 
 /// Read one pkt-line from data at the given position.
@@ -583,7 +682,7 @@ fn read_pkt_line(data: &[u8], pos: usize) -> Option<(Option<&[u8]>, usize)> {
 }
 
 /// Parse a single command line: "<old-hex> <new-hex> <refname>[\0capabilities]\n"
-fn parse_single_command(line: &[u8]) -> Option<RefCommand> {
+fn parse_single_command(line: &[u8]) -> Option<(RefCommand, HashSet<String>)> {
     // Strip trailing newline
     let line = if line.last() == Some(&b'\n') {
         &line[..line.len() - 1]
@@ -591,10 +690,9 @@ fn parse_single_command(line: &[u8]) -> Option<RefCommand> {
         line
     };
 
-    // Strip capabilities after NUL (first line only)
-    let line = match line.iter().position(|&b| b == 0) {
-        Some(pos) => &line[..pos],
-        None => line,
+    let (line, capabilities) = match line.iter().position(|&b| b == 0) {
+        Some(pos) => (&line[..pos], parse_capabilities(&line[pos + 1..])),
+        None => (line, HashSet::new()),
     };
 
     let text = std::str::from_utf8(line).ok()?;
@@ -603,11 +701,99 @@ fn parse_single_command(line: &[u8]) -> Option<RefCommand> {
         return None;
     }
 
-    Some(RefCommand {
-        old_hash: parts[0].to_string(),
-        new_hash: parts[1].to_string(),
-        ref_name: parts[2].to_string(),
-    })
+    Some((
+        RefCommand {
+            old_hash: parts[0].to_string(),
+            new_hash: parts[1].to_string(),
+            ref_name: parts[2].to_string(),
+        },
+        capabilities,
+    ))
+}
+
+fn parse_capabilities(raw: &[u8]) -> HashSet<String> {
+    std::str::from_utf8(raw)
+        .ok()
+        .map(|text| text.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn preferred_sideband_mode(capabilities: &HashSet<String>) -> Option<SidebandMode> {
+    if capabilities.contains("side-band-64k") {
+        Some(SidebandMode::Large)
+    } else if capabilities.contains("side-band") {
+        Some(SidebandMode::Small)
+    } else {
+        None
+    }
+}
+
+fn requested_sideband_mode(
+    capabilities: &HashSet<String>,
+) -> std::result::Result<Option<SidebandMode>, String> {
+    let wants_small = capabilities.contains("side-band");
+    let wants_large = capabilities.contains("side-band-64k");
+
+    if wants_small && wants_large {
+        return Err("client requested both side-band and side-band-64k".into());
+    }
+
+    Ok(preferred_sideband_mode(capabilities))
+}
+
+fn should_send_upload_progress(
+    request: &UploadRequest,
+    sideband_mode: Option<SidebandMode>,
+) -> bool {
+    sideband_mode.is_some() && !request.capabilities.contains("no-progress")
+}
+
+fn should_send_receive_progress(
+    request: &ReceivePackRequest,
+    sideband_mode: Option<SidebandMode>,
+) -> bool {
+    sideband_mode.is_some() && !request.capabilities.contains("quiet")
+}
+
+fn upload_pack_progress_messages(object_count: usize) -> Vec<String> {
+    vec![
+        format!("Enumerating objects: {}, done.\n", object_count),
+        format!(
+            "Counting objects: 100% ({}/{}), done.\n",
+            object_count, object_count
+        ),
+        format!(
+            "Compressing objects: 100% ({}/{}), done.\n",
+            object_count, object_count
+        ),
+        format!(
+            "Total {} (delta 0), reused 0 (delta 0), pack-reused 0\n",
+            object_count
+        ),
+    ]
+}
+
+fn receive_pack_progress_messages(
+    request: &ReceivePackRequest,
+    pack_bytes: usize,
+    ok_count: usize,
+    failed_count: usize,
+    rebuilt_default_branch_fts: bool,
+) -> Vec<String> {
+    let mut messages = vec![
+        format!("Processing {} ref update(s).\n", request.commands.len()),
+        format!("Received pack: {} bytes.\n", pack_bytes),
+        format!(
+            "Updated refs: {} succeeded, {} failed.\n",
+            ok_count, failed_count
+        ),
+    ];
+
+    if rebuilt_default_branch_fts {
+        messages.push("Rebuilt search index for the default branch.\n".to_string());
+    }
+
+    messages
 }
 
 // ---------------------------------------------------------------------------
@@ -616,9 +802,24 @@ fn parse_single_command(line: &[u8]) -> Option<RefCommand> {
 
 /// Build a report-status response in pkt-line format.
 fn build_report_status(results: &[(String, std::result::Result<(), String>)]) -> Vec<u8> {
+    build_report_status_with_unpack_result("ok", results)
+}
+
+fn build_unpack_error_status(commands: &[RefCommand], reason: &str) -> Vec<u8> {
+    let results: Vec<(String, std::result::Result<(), String>)> = commands
+        .iter()
+        .map(|cmd| (cmd.ref_name.clone(), Err(reason.to_string())))
+        .collect();
+    build_report_status_with_unpack_result(reason, &results)
+}
+
+fn build_report_status_with_unpack_result(
+    unpack_result: &str,
+    results: &[(String, std::result::Result<(), String>)],
+) -> Vec<u8> {
     let mut buf = Vec::new();
 
-    pkt_line_bytes(&mut buf, b"unpack ok\n");
+    pkt_line_bytes(&mut buf, format!("unpack {}\n", unpack_result).as_bytes());
 
     for (ref_name, result) in results {
         match result {
@@ -637,6 +838,78 @@ fn build_report_status(results: &[(String, std::result::Result<(), String>)]) ->
     buf
 }
 
+fn maybe_sideband_wrap_with_progress(
+    body: Vec<u8>,
+    progress_messages: &[String],
+    sideband_mode: Option<SidebandMode>,
+) -> Vec<u8> {
+    match sideband_mode {
+        Some(mode) => {
+            let mut wrapped = Vec::new();
+            for message in progress_messages {
+                append_sideband_data(&mut wrapped, 2, message.as_bytes(), mode);
+            }
+            append_sideband_data(&mut wrapped, 1, &body, mode);
+            wrapped.extend_from_slice(b"0000");
+            wrapped
+        }
+        None => body,
+    }
+}
+
+fn protocol_result_response(service: &str, body: Vec<u8>) -> Result<Response> {
+    let mut resp = Response::from_bytes(body)?;
+    resp.headers_mut()
+        .set("Content-Type", &format!("application/x-{}-result", service))?;
+    Ok(resp)
+}
+
+fn protocol_fatal_response(
+    service: &str,
+    message: &str,
+    sideband_mode: Option<SidebandMode>,
+) -> Result<Response> {
+    protocol_result_response(service, protocol_fatal_body(message, sideband_mode))
+}
+
+fn protocol_fatal_body(message: &str, sideband_mode: Option<SidebandMode>) -> Vec<u8> {
+    match sideband_mode {
+        Some(mode) => {
+            let mut body = Vec::new();
+            append_sideband_data(
+                &mut body,
+                3,
+                format!("fatal: {}\n", message).as_bytes(),
+                mode,
+            );
+            body.extend_from_slice(b"0000");
+            body
+        }
+        None => {
+            let mut body = Vec::new();
+            pkt_line_bytes(&mut body, format!("ERR {}\n", message).as_bytes());
+            body.extend_from_slice(b"0000");
+            body
+        }
+    }
+}
+
+fn protocol_error_message(err: &Error) -> String {
+    match err {
+        Error::RustError(message) => message.clone(),
+        _ => err.to_string(),
+    }
+}
+
+fn append_sideband_data(buf: &mut Vec<u8>, channel: u8, data: &[u8], mode: SidebandMode) {
+    for chunk in data.chunks(mode.max_data_len()) {
+        let mut payload = Vec::with_capacity(1 + chunk.len());
+        payload.push(channel);
+        payload.extend_from_slice(chunk);
+        pkt_line_bytes(buf, &payload);
+    }
+}
+
 fn pkt_line_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     let len = 4 + data.len();
     buf.extend_from_slice(format!("{:04x}", len).as_bytes());
@@ -646,6 +919,208 @@ fn pkt_line_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_receive_pack_request_reads_capabilities_and_pack_offset() {
+        let mut body = Vec::new();
+        pkt_line_bytes(
+            &mut body,
+            b"0000000000000000000000000000000000000000 0123456789012345678901234567890123456789 refs/heads/main\0report-status side-band-64k ofs-delta\n",
+        );
+        body.extend_from_slice(b"0000PACK");
+
+        let request = parse_receive_pack_request(&body);
+
+        assert_eq!(request.commands.len(), 1);
+        assert_eq!(request.commands[0].ref_name, "refs/heads/main");
+        assert_eq!(request.pack_offset, body.len() - 4);
+        assert!(request.capabilities.contains("report-status"));
+        assert!(request.capabilities.contains("side-band-64k"));
+        assert!(request.capabilities.contains("ofs-delta"));
+    }
+
+    #[test]
+    fn requested_sideband_mode_rejects_conflicting_requests() {
+        let capabilities = HashSet::from(["side-band".to_string(), "side-band-64k".to_string()]);
+
+        let err = requested_sideband_mode(&capabilities).expect_err("conflicting sideband");
+
+        assert_eq!(err, "client requested both side-band and side-band-64k");
+    }
+
+    #[test]
+    fn maybe_sideband_wrap_encodes_report_status_on_channel_one() {
+        let body = build_report_status(&[("refs/heads/main".to_string(), Ok(()))]);
+
+        let wrapped =
+            maybe_sideband_wrap_with_progress(body.clone(), &[], Some(SidebandMode::Large));
+
+        let mut expected = Vec::new();
+        let mut payload = Vec::new();
+        payload.push(1);
+        payload.extend_from_slice(&body);
+        pkt_line_bytes(&mut expected, &payload);
+        expected.extend_from_slice(b"0000");
+        assert_eq!(wrapped, expected);
+    }
+
+    #[test]
+    fn maybe_sideband_wrap_with_progress_places_channel_two_before_status() {
+        let body = build_report_status(&[("refs/heads/main".to_string(), Ok(()))]);
+        let progress = vec!["Processing 1 ref update(s).\n".to_string()];
+
+        let wrapped =
+            maybe_sideband_wrap_with_progress(body.clone(), &progress, Some(SidebandMode::Large));
+
+        let mut expected = Vec::new();
+        let mut progress_payload = Vec::new();
+        progress_payload.push(2);
+        progress_payload.extend_from_slice(progress[0].as_bytes());
+        pkt_line_bytes(&mut expected, &progress_payload);
+        let mut status_payload = Vec::new();
+        status_payload.push(1);
+        status_payload.extend_from_slice(&body);
+        pkt_line_bytes(&mut expected, &status_payload);
+        expected.extend_from_slice(b"0000");
+        assert_eq!(wrapped, expected);
+    }
+
+    #[test]
+    fn upload_pack_progress_can_be_suppressed_by_no_progress() {
+        let request = UploadRequest {
+            capabilities: HashSet::from(["no-progress".to_string()]),
+            ..UploadRequest::default()
+        };
+
+        assert!(!should_send_upload_progress(
+            &request,
+            Some(SidebandMode::Large)
+        ));
+        assert!(should_send_upload_progress(
+            &UploadRequest::default(),
+            Some(SidebandMode::Large)
+        ));
+        assert!(!should_send_upload_progress(
+            &UploadRequest::default(),
+            None
+        ));
+    }
+
+    #[test]
+    fn receive_pack_progress_can_be_suppressed_by_quiet() {
+        let request = ReceivePackRequest {
+            capabilities: HashSet::from(["quiet".to_string()]),
+            ..ReceivePackRequest::default()
+        };
+
+        assert!(!should_send_receive_progress(
+            &request,
+            Some(SidebandMode::Large)
+        ));
+        assert!(should_send_receive_progress(
+            &ReceivePackRequest::default(),
+            Some(SidebandMode::Large)
+        ));
+        assert!(!should_send_receive_progress(
+            &ReceivePackRequest::default(),
+            None
+        ));
+    }
+
+    #[test]
+    fn upload_pack_progress_messages_include_expected_stages() {
+        let messages = upload_pack_progress_messages(7);
+
+        assert_eq!(
+            messages,
+            vec![
+                "Enumerating objects: 7, done.\n",
+                "Counting objects: 100% (7/7), done.\n",
+                "Compressing objects: 100% (7/7), done.\n",
+                "Total 7 (delta 0), reused 0 (delta 0), pack-reused 0\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn receive_pack_progress_messages_include_summary_and_rebuild_notice() {
+        let request = ReceivePackRequest {
+            commands: vec![RefCommand {
+                old_hash: store::ZERO_HASH.to_string(),
+                new_hash: "0123456789012345678901234567890123456789".to_string(),
+                ref_name: "refs/heads/main".to_string(),
+            }],
+            ..ReceivePackRequest::default()
+        };
+
+        let messages = receive_pack_progress_messages(&request, 1234, 1, 0, true);
+
+        assert_eq!(
+            messages,
+            vec![
+                "Processing 1 ref update(s).\n",
+                "Received pack: 1234 bytes.\n",
+                "Updated refs: 1 succeeded, 0 failed.\n",
+                "Rebuilt search index for the default branch.\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn append_sideband_data_splits_payloads_at_mode_boundary() {
+        let data = vec![b'x'; 1_100];
+        let mut wrapped = Vec::new();
+
+        append_sideband_data(&mut wrapped, 1, &data, SidebandMode::Small);
+
+        let mut expected = Vec::new();
+        let mut first = vec![1];
+        first.extend(vec![b'x'; 995]);
+        pkt_line_bytes(&mut expected, &first);
+        let mut second = vec![1];
+        second.extend(vec![b'x'; 105]);
+        pkt_line_bytes(&mut expected, &second);
+        assert_eq!(wrapped, expected);
+    }
+
+    #[test]
+    fn build_unpack_error_status_uses_unpack_error_without_ng_prefix() {
+        let commands = vec![RefCommand {
+            old_hash: store::ZERO_HASH.to_string(),
+            new_hash: "0123456789012345678901234567890123456789".to_string(),
+            ref_name: "refs/heads/main".to_string(),
+        }];
+
+        let status = build_unpack_error_status(&commands, "pack too large");
+
+        let mut expected = Vec::new();
+        pkt_line_bytes(&mut expected, b"unpack pack too large\n");
+        pkt_line_bytes(&mut expected, b"ng refs/heads/main pack too large\n");
+        expected.extend_from_slice(b"0000");
+        assert_eq!(status, expected);
+    }
+
+    #[test]
+    fn protocol_fatal_body_uses_channel_three_when_sideband_is_active() {
+        let body = protocol_fatal_body("boom", Some(SidebandMode::Large));
+
+        let mut expected = Vec::new();
+        let mut payload = vec![3];
+        payload.extend_from_slice(b"fatal: boom\n");
+        pkt_line_bytes(&mut expected, &payload);
+        expected.extend_from_slice(b"0000");
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn protocol_fatal_body_uses_err_pkt_line_without_sideband() {
+        let body = protocol_fatal_body("boom", None);
+
+        let mut expected = Vec::new();
+        pkt_line_bytes(&mut expected, b"ERR boom\n");
+        expected.extend_from_slice(b"0000");
+        assert_eq!(body, expected);
+    }
 
     #[test]
     fn parse_upload_request_reads_caps_haves_and_done() {

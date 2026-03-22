@@ -1084,11 +1084,11 @@ impl Repository {
             .unwrap_or_else(|| "refs/heads/main".to_string());
         let caps = match service {
             "git-upload-pack" => format!(
-                "multi_ack_detailed no-done ofs-delta symref=HEAD:{}",
+                "multi_ack_detailed no-done ofs-delta side-band-64k no-progress symref=HEAD:{}",
                 default_branch
             ),
             _ => format!(
-                "report-status delete-refs ofs-delta symref=HEAD:{}",
+                "report-status delete-refs ofs-delta side-band-64k quiet symref=HEAD:{}",
                 default_branch
             ),
         };

@@ -60,7 +60,7 @@ impl ObjectType {
 }
 
 /// A fully resolved pack object with type and data.
-/// Used by `generate()` for fetch/clone and by `collect_objects()` in store.
+/// Used by `generate_into()` for fetch/clone and by `collect_objects()` in store.
 #[derive(Debug)]
 pub struct PackObject {
     pub obj_type: ObjectType,
@@ -430,28 +430,39 @@ pub fn resolve_entry(
 // Pack generation (for git fetch / clone)
 // ---------------------------------------------------------------------------
 
-/// Generate a valid pack file from a list of objects.
-/// All objects are stored as full (non-delta) entries for simplicity.
-pub fn generate(objects: &[PackObject]) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Generate a valid pack file and write each chunk to `sink` as it becomes
+/// available. This avoids creating a second full-size copy when callers want
+/// to append the pack directly into a larger response body or sideband stream.
+pub fn generate_into<F>(objects: &[PackObject], mut sink: F)
+where
+    F: FnMut(&[u8]),
+{
+    let mut hasher = sha1_smol::Sha1::new();
 
-    // Header
-    buf.extend_from_slice(b"PACK");
-    buf.extend_from_slice(&2u32.to_be_bytes()); // version 2
-    buf.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    let mut header = Vec::with_capacity(12);
+    header.extend_from_slice(b"PACK");
+    header.extend_from_slice(&2u32.to_be_bytes()); // version 2
+    header.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    hasher.update(&header);
+    sink(&header);
 
-    // Objects
     for obj in objects {
-        write_type_and_size(&mut buf, obj.obj_type.to_type_num(), obj.data.len());
+        let mut object_header = Vec::with_capacity(16);
+        write_type_and_size(
+            &mut object_header,
+            obj.obj_type.to_type_num(),
+            obj.data.len(),
+        );
+        hasher.update(&object_header);
+        sink(&object_header);
+
         let compressed = zlib_compress(&obj.data);
-        buf.extend_from_slice(&compressed);
+        hasher.update(&compressed);
+        sink(&compressed);
     }
 
-    // Trailing SHA-1 checksum of everything
-    let checksum = sha1_digest(&buf);
-    buf.extend_from_slice(&checksum);
-
-    buf
+    let checksum = hasher.digest().bytes();
+    sink(&checksum);
 }
 
 // ---------------------------------------------------------------------------
@@ -706,12 +717,6 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).expect("zlib compress write");
     encoder.finish().expect("zlib compress finish")
-}
-
-fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut hasher = sha1_smol::Sha1::new();
-    hasher.update(data);
-    hasher.digest().bytes()
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {

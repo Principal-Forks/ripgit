@@ -1,0 +1,117 @@
+{
+  "id": "ripgit-tour",
+  "title": "ripgit: A Git Server in a Single Durable Object",
+  "description": "How ripgit implements a full git server with push, fetch, web UI, and issues — all inside one Cloudflare Durable Object with SQLite.",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "id": "what-is-ripgit",
+      "title": "One Durable Object = One Git Repo",
+      "description": "ripgit is a self-hosted git server on Cloudflare Workers. lib.rs routes each /:owner/:repo request to a Durable Object instance backed by SQLite — so every repository is an isolated, stateful process with its own database.",
+      "focusDirectory": "src",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "entry-point",
+          "name": "Worker Entry & DO",
+          "color": "#f59e0b",
+          "items": [
+            { "path": "src/lib.rs", "type": "file" },
+            { "path": "src/schema.rs", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "git-protocol",
+      "title": "Streaming Git Protocol",
+      "description": "git.rs handles push and fetch via Smart HTTP. Pack files are processed in two phases: pack.rs indexes entries with O(1) memory, then git.rs resolves deltas through a bounded 20 MB cache — keeping memory under Cloudflare's 128 MB limit even for large repos.",
+      "focusDirectory": "src",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "git-core",
+          "name": "Git Protocol",
+          "color": "#ef4444",
+          "items": [
+            { "path": "src/git.rs", "type": "file" },
+            { "path": "src/pack.rs", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "storage-layer",
+      "title": "Dual Storage with Delta Compression",
+      "description": "store.rs uses a dual-storage model: commits and trees are stored both parsed (for queries) and raw (for byte-perfect git fetch). Blobs use xpatch delta compression with keyframe intervals every 50 versions. Three FTS5 tables power full-text search across code and commits.",
+      "focusDirectory": "src",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "storage",
+          "name": "Storage & Search",
+          "color": "#3b82f6",
+          "items": [
+            { "path": "src/store.rs", "type": "file" },
+            { "path": "src/api.rs", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "issues-and-merges",
+      "title": "Issues, PRs & Three-Way Merge",
+      "description": "issues.rs implements issues and pull requests in a unified table. PRs support real three-way merge: find the merge base via BFS, flatten both trees, union file-level changes, and create a proper merge commit — all in SQLite, no git binary needed.",
+      "focusDirectory": "src",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "issues",
+          "name": "Issues & PRs",
+          "color": "#8b5cf6",
+          "items": [
+            { "path": "src/issues.rs", "type": "file" },
+            { "path": "src/diff.rs", "type": "file" },
+            { "path": "src/issues_web", "type": "directory" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "web-ui",
+      "title": "Server-Rendered Web UI, No Build Step",
+      "description": "web.rs generates all HTML via Rust format!() strings — no frontend framework, no static assets. Content negotiation in presentation.rs lets the same route serve HTML, JSON, or Markdown based on the Accept header.",
+      "focusDirectory": "src",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "web",
+          "name": "Web UI & Negotiation",
+          "color": "#10b981",
+          "items": [
+            { "path": "src/web.rs", "type": "file" },
+            { "path": "src/web", "type": "directory" },
+            { "path": "src/presentation.rs", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "full-picture",
+      "title": "The Full Picture",
+      "description": "~9,600 lines of Rust implement a complete git server: protocol handling, delta-compressed storage, full-text search, issues with real merges, and a server-rendered UI — all deployed as a single Cloudflare Worker.",
+      "focusDirectory": "",
+      "colorMode": "fileTypes"
+    }
+  ]
+}

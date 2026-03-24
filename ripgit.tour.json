@@ -109,7 +109,7 @@
     {
       "id": "full-picture",
       "title": "The Full Picture",
-      "description": "~9,600 lines of Rust implement a complete git server: protocol handling, delta-compressed storage, full-text search, issues with real merges, and a server-rendered UI — all deployed as a single Cloudflare Worker.",
+      "description": "Under 10,000 lines of Rust implement a complete git server: protocol handling, delta-compressed storage, full-text search, issues with real merges, and a server-rendered UI — all deployed as a single Cloudflare Worker.",
       "focusDirectory": "",
       "colorMode": "fileTypes"
     }
